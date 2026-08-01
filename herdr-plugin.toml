@@ -1,0 +1,45 @@
+id = "shadowfax.beacon"
+name = "Beacon"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Jump to the newest unread Herdr agent."
+platforms = ["macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[actions]]
+id = "jump-unread"
+title = "Jump to unread agent"
+description = "Focus the newest unread agent."
+command = ["./target/release/herdr-beacon", "jump-unread"]
+
+[[actions]]
+id = "install-keybindings"
+title = "Install Beacon keybinding"
+description = "Bind Alt-U to jump to the newest unread agent."
+command = ["./target/release/herdr-beacon", "install-keybindings"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./target/release/herdr-beacon", "event"]
+
+[[events]]
+on = "pane.focused"
+command = ["./target/release/herdr-beacon", "event"]
+
+[[events]]
+on = "pane.closed"
+command = ["./target/release/herdr-beacon", "event"]
+
+[[events]]
+on = "pane.exited"
+command = ["./target/release/herdr-beacon", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["./target/release/herdr-beacon", "event"]
+
+[[events]]
+on = "pane.moved"
+command = ["./target/release/herdr-beacon", "event"]
