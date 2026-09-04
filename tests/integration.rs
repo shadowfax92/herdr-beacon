@@ -15,7 +15,13 @@ printf '%s\n' "$*" >> "$FAKE_HERDR_LOG"
 if [ "$1 $2" = "agent get" ]; then
   printf '%s\n' '{"id":"fake","result":{"type":"agent_get","agent":{"terminal_id":"terminal-1","agent_status":"done","workspace_id":"w1","pane_id":"w1:p1","focused":false,"state_change_seq":8}}}'
 elif [ "$1 $2" = "agent list" ]; then
-  printf '%s\n' '{"id":"fake","result":{"type":"agent_list","agents":[]}}'
+  if [ "$FAKE_AGENT_LIST" = "working" ]; then
+    printf '%s\n' '{"id":"fake","result":{"type":"agent_list","agents":[{"terminal_id":"terminal-1","agent_status":"working","workspace_id":"w1","pane_id":"w1:p1","focused":true,"state_change_seq":10},{"terminal_id":"terminal-2","agent_status":"working","workspace_id":"w1","pane_id":"w1:p2","focused":false,"state_change_seq":8}]}}'
+  else
+    printf '%s\n' '{"id":"fake","result":{"type":"agent_list","agents":[]}}'
+  fi
+elif [ "$1 $2" = "agent focus" ]; then
+  printf '%s\n' '{"id":"fake","result":{"type":"agent_focus","agent":{"terminal_id":"terminal-2","agent_status":"working","workspace_id":"w1","pane_id":"w1:p2","focused":true,"state_change_seq":8}}}'
 elif [ "$1 $2" = "notification show" ]; then
   printf '%s\n' '{"id":"fake","result":{"type":"notification_show","shown":true,"reason":"shown"}}'
 else
@@ -84,5 +90,28 @@ fn empty_jump_requests_an_explicitly_soundless_notification() {
     assert_eq!(
         fs::read_to_string(log).unwrap(),
         "agent list\nnotification show No unread agents --sound none\n"
+    );
+}
+
+#[test]
+fn working_jump_focuses_the_next_active_turn() {
+    let temporary = tempdir().unwrap();
+    let log = temporary.path().join("commands.log");
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
+        .arg("jump-working")
+        .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("FAKE_AGENT_LIST", "working")
+        .env("FAKE_HERDR_LOG", &log)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        "agent list\nagent focus w1:p2\n"
     );
 }
