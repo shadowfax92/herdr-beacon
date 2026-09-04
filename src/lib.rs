@@ -9,7 +9,10 @@ pub mod model;
 pub mod state;
 
 #[derive(Debug, Parser)]
-#[command(name = "herdr-beacon", about = "Unread agent navigation for Herdr")]
+#[command(
+    name = "herdr-beacon",
+    about = "Attention and working-agent navigation for Herdr"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -19,6 +22,7 @@ struct Cli {
 enum Commands {
     Event,
     JumpUnread,
+    JumpWorking,
     InstallKeybindings,
 }
 
@@ -27,6 +31,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Event => event::handle_event_from_environment(),
         Commands::JumpUnread => jump::jump_from_environment().map(|_| ()),
+        Commands::JumpWorking => jump::jump_working_from_environment().map(|_| ()),
         Commands::InstallKeybindings => keybindings::install_from_environment().map(|_| ()),
     }
 }

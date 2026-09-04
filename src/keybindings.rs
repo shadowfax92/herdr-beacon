@@ -10,9 +10,34 @@ use uuid::Uuid;
 
 use crate::herdr::{Herdr, HerdrClient};
 
-const KEY: &str = "alt+u";
-const COMMAND: &str = "shadowfax.beacon.jump-unread";
-const DESCRIPTION: &str = "Jump to newest unread agent";
+const UNREAD_KEY: &str = "alt+u";
+const UNREAD_COMMAND: &str = "shadowfax.beacon.jump-unread";
+const UNREAD_DESCRIPTION: &str = "Jump to newest unread agent";
+const WORKING_KEY: &str = "alt+o";
+const WORKING_COMMAND: &str = "shadowfax.beacon.jump-working";
+const WORKING_DESCRIPTION: &str = "Cycle through working agents";
+
+/// One direct Herdr shortcut owned and normalized by Beacon's installer.
+struct Binding {
+    key: &'static str,
+    command: &'static str,
+    description: &'static str,
+}
+
+// This is the complete Beacon-owned set. Installation validates every destination
+// before rewriting either entry so a conflict cannot leave a partially upgraded config.
+const BINDINGS: [Binding; 2] = [
+    Binding {
+        key: UNREAD_KEY,
+        command: UNREAD_COMMAND,
+        description: UNREAD_DESCRIPTION,
+    },
+    Binding {
+        key: WORKING_KEY,
+        command: WORKING_COMMAND,
+        description: WORKING_DESCRIPTION,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -27,13 +52,13 @@ pub fn install_from_environment() -> Result<InstallOutcome> {
     match &outcome {
         InstallOutcome::Updated { .. } => {
             herdr.reload_config()?;
-            if let Err(error) = herdr.notify("Beacon is bound to Alt-U", None) {
+            if let Err(error) = herdr.notify("Beacon is bound to Alt-U and Alt-O", None) {
                 eprintln!("Beacon keybinding installed; confirmation not shown: {error}");
             }
         }
         InstallOutcome::Unchanged => {
-            if let Err(error) = herdr.notify("Beacon keybinding is already installed", None) {
-                eprintln!("Beacon keybinding is installed; confirmation not shown: {error}");
+            if let Err(error) = herdr.notify("Beacon keybindings are already installed", None) {
+                eprintln!("Beacon keybindings are installed; confirmation not shown: {error}");
             }
         }
     }
@@ -67,24 +92,36 @@ pub fn install(path: &Path) -> Result<InstallOutcome> {
         None => DocumentMut::new(),
     };
 
-    ensure_builtin_key_is_available(&document)?;
+    ensure_builtin_keys_are_available(&document)?;
     let commands = commands_mut(&mut document)?;
-    if commands.iter().any(|table| {
-        table_string(table, "key") == Some(KEY) && table_string(table, "command") != Some(COMMAND)
-    }) {
-        bail!("{KEY} is already bound to another custom command");
+    for binding in &BINDINGS {
+        if commands.iter().any(|table| {
+            table_string(table, "key") == Some(binding.key)
+                && table_string(table, "command") != Some(binding.command)
+        }) {
+            bail!("{} is already bound to another custom command", binding.key);
+        }
     }
 
-    let beacon_commands = commands
-        .iter()
-        .filter(|table| table_string(table, "command") == Some(COMMAND))
-        .collect::<Vec<_>>();
-    if beacon_commands.len() == 1 && is_desired(beacon_commands[0]) {
+    let all_bindings_are_current = BINDINGS.iter().all(|binding| {
+        let matching = commands
+            .iter()
+            .filter(|table| table_string(table, "command") == Some(binding.command))
+            .collect::<Vec<_>>();
+        matching.len() == 1 && is_desired(matching[0], binding)
+    });
+    if all_bindings_are_current {
         return Ok(InstallOutcome::Unchanged);
     }
 
-    commands.retain(|table| table_string(table, "command") != Some(COMMAND));
-    commands.push(beacon_table());
+    commands.retain(|table| {
+        !BINDINGS
+            .iter()
+            .any(|binding| table_string(table, "command") == Some(binding.command))
+    });
+    for binding in &BINDINGS {
+        commands.push(beacon_table(binding));
+    }
     let rendered = document.to_string();
     if original.as_deref() == Some(rendered.as_str()) {
         return Ok(InstallOutcome::Unchanged);
@@ -135,36 +172,40 @@ fn table_string<'a>(table: &'a Table, key: &str) -> Option<&'a str> {
     table.get(key).and_then(Item::as_str)
 }
 
-fn ensure_builtin_key_is_available(document: &DocumentMut) -> Result<()> {
+fn ensure_builtin_keys_are_available(document: &DocumentMut) -> Result<()> {
     let Some(keys) = document.get("keys").and_then(Item::as_table) else {
         return Ok(());
     };
-    for (name, item) in keys.iter().filter(|(name, _)| *name != "command") {
-        let occupied = item.as_str() == Some(KEY)
-            || item
-                .as_array()
-                .is_some_and(|array| array.iter().any(|value| value.as_str() == Some(KEY)));
-        if occupied {
-            bail!("{KEY} is already assigned to keys.{name}");
+    for binding in &BINDINGS {
+        for (name, item) in keys.iter().filter(|(name, _)| *name != "command") {
+            let occupied = item.as_str() == Some(binding.key)
+                || item.as_array().is_some_and(|array| {
+                    array
+                        .iter()
+                        .any(|value| value.as_str() == Some(binding.key))
+                });
+            if occupied {
+                bail!("{} is already assigned to keys.{name}", binding.key);
+            }
         }
     }
     Ok(())
 }
 
-fn is_desired(table: &Table) -> bool {
+fn is_desired(table: &Table, binding: &Binding) -> bool {
     table.len() == 4
-        && table_string(table, "key") == Some(KEY)
+        && table_string(table, "key") == Some(binding.key)
         && table_string(table, "type") == Some("plugin_action")
-        && table_string(table, "command") == Some(COMMAND)
-        && table_string(table, "description") == Some(DESCRIPTION)
+        && table_string(table, "command") == Some(binding.command)
+        && table_string(table, "description") == Some(binding.description)
 }
 
-fn beacon_table() -> Table {
+fn beacon_table(binding: &Binding) -> Table {
     let mut table = Table::new();
-    table.insert("key", value(KEY));
+    table.insert("key", value(binding.key));
     table.insert("type", value("plugin_action"));
-    table.insert("command", value(COMMAND));
-    table.insert("description", value(DESCRIPTION));
+    table.insert("command", value(binding.command));
+    table.insert("description", value(binding.description));
     table
 }
 
@@ -280,7 +321,8 @@ description = "Scratch"
             commands(&path),
             vec![
                 ("alt+i".into(), "shadowfax.scratch.toggle-nvim".into()),
-                (KEY.into(), COMMAND.into()),
+                (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
+                ("alt+o".into(), "shadowfax.beacon.jump-working".into(),),
             ]
         );
     }
@@ -320,7 +362,13 @@ description = "Duplicate"
 
         install(&path).unwrap();
 
-        assert_eq!(commands(&path), vec![(KEY.into(), COMMAND.into())]);
+        assert_eq!(
+            commands(&path),
+            vec![
+                (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
+                (WORKING_KEY.into(), WORKING_COMMAND.into()),
+            ]
+        );
     }
 
     #[test]
@@ -337,6 +385,23 @@ description = "Keep me"
         let error = install(&path).unwrap_err();
 
         assert!(error.to_string().contains("already bound"));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn install_refuses_an_existing_custom_alt_o_binding() {
+        let original = r#"[keys]
+[[keys.command]]
+key = "alt+o"
+type = "plugin_action"
+command = "someone.else.open"
+description = "Keep me"
+"#;
+        let (_directory, path) = write_config(original);
+
+        let error = install(&path).unwrap_err();
+
+        assert!(error.to_string().contains("alt+o is already bound"));
         assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
@@ -360,6 +425,12 @@ description = "Keep me"
             install(&path).unwrap(),
             InstallOutcome::Updated { backup: None }
         );
-        assert_eq!(commands(&path), vec![(KEY.into(), COMMAND.into())]);
+        assert_eq!(
+            commands(&path),
+            vec![
+                (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
+                (WORKING_KEY.into(), WORKING_COMMAND.into()),
+            ]
+        );
     }
 }

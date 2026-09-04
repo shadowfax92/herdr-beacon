@@ -13,6 +13,7 @@ fn cli_exposes_only_the_supported_commands() {
     assert!(output.status.success());
     assert!(stdout.contains("event"));
     assert!(stdout.contains("jump-unread"));
+    assert!(stdout.contains("jump-working"));
     assert!(stdout.contains("install-keybindings"));
 }
 
@@ -36,7 +37,10 @@ fn manifest_declares_actions_hooks_and_locked_build() {
         .iter()
         .map(|action| action["id"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(action_ids, ["jump-unread", "install-keybindings"]);
+    assert_eq!(
+        action_ids,
+        ["jump-unread", "jump-working", "install-keybindings"]
+    );
 
     let events = value["events"].as_array_of_tables().unwrap();
     let event_names = events

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 
 use crate::herdr::{Herdr, HerdrClient};
-use crate::model::{ObservationSource, UnreadEntry};
+use crate::model::{AgentStatus, ObservationSource, UnreadEntry};
 use crate::state::StateStore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +15,41 @@ pub enum JumpOutcome {
 pub fn jump_from_environment() -> Result<JumpOutcome> {
     let store = StateStore::from_environment()?;
     jump_unread(&Herdr::from_environment(), &store)
+}
+
+pub fn jump_working_from_environment() -> Result<JumpOutcome> {
+    jump_working(&Herdr::from_environment())
+}
+
+/// Advances through live working agents without changing Beacon's unread queue.
+/// Herdr's status sequence supplies a cross-workspace recency order; the focused
+/// working pane is the cursor so repeated invocations visit every active turn.
+pub fn jump_working(herdr: &impl HerdrClient) -> Result<JumpOutcome> {
+    let mut working = herdr
+        .agent_list()?
+        .into_iter()
+        .filter(|agent| agent.status == AgentStatus::Working)
+        .collect::<Vec<_>>();
+    working.sort_by(|left, right| {
+        right
+            .state_change_seq
+            .cmp(&left.state_change_seq)
+            .then_with(|| left.pane_id.cmp(&right.pane_id))
+    });
+
+    if working.is_empty() {
+        herdr.notify("No working agents", None)?;
+        return Ok(JumpOutcome::Empty);
+    }
+
+    let next = working
+        .iter()
+        .position(|agent| agent.focused)
+        .map(|index| (index + 1) % working.len())
+        .unwrap_or(0);
+    let pane_id = working[next].pane_id.clone();
+    herdr.focus_agent(&pane_id)?;
+    Ok(JumpOutcome::Focused(pane_id))
 }
 
 pub fn jump_unread(herdr: &impl HerdrClient, store: &StateStore) -> Result<JumpOutcome> {
@@ -168,6 +203,67 @@ mod tests {
         let state = store.read().unwrap();
         assert_eq!(state.entries().len(), 1);
         assert_eq!(state.newest().unwrap().pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn working_jump_advances_from_the_focused_agent_in_recency_order() {
+        let mut newest = agent("w1:p1", AgentStatus::Working, 12);
+        newest.focused = true;
+        let fake = FakeHerdr::new(vec![
+            agent("w1:p3", AgentStatus::Working, 4),
+            newest,
+            agent("w1:p2", AgentStatus::Working, 8),
+            agent("w1:p4", AgentStatus::Idle, 20),
+        ]);
+
+        let outcome = jump_working(&fake).unwrap();
+
+        assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
+        assert_eq!(*fake.focused.lock().unwrap(), ["w1:p2"]);
+    }
+
+    #[test]
+    fn working_jump_starts_with_the_newest_turn_when_focus_is_elsewhere() {
+        let mut idle = agent("w1:p3", AgentStatus::Idle, 20);
+        idle.focused = true;
+        let fake = FakeHerdr::new(vec![
+            agent("w1:p1", AgentStatus::Working, 8),
+            idle,
+            agent("w1:p2", AgentStatus::Working, 12),
+        ]);
+
+        let outcome = jump_working(&fake).unwrap();
+
+        assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
+    }
+
+    #[test]
+    fn working_jump_wraps_from_the_oldest_turn_to_the_newest() {
+        let mut oldest = agent("w1:p1", AgentStatus::Working, 4);
+        oldest.focused = true;
+        let fake = FakeHerdr::new(vec![
+            oldest,
+            agent("w1:p2", AgentStatus::Working, 12),
+            agent("w1:p3", AgentStatus::Working, 8),
+        ]);
+
+        let outcome = jump_working(&fake).unwrap();
+
+        assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
+    }
+
+    #[test]
+    fn working_jump_reports_an_empty_queue_without_focusing() {
+        let fake = FakeHerdr::new(vec![
+            agent("w1:p1", AgentStatus::Idle, 8),
+            agent("w1:p2", AgentStatus::Done, 12),
+        ]);
+
+        let outcome = jump_working(&fake).unwrap();
+
+        assert_eq!(outcome, JumpOutcome::Empty);
+        assert!(fake.focused.lock().unwrap().is_empty());
+        assert_eq!(*fake.notifications.lock().unwrap(), ["No working agents"]);
     }
 
     #[test]
