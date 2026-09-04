@@ -61,7 +61,7 @@ Herdr runs Beacon on agent-status, pane-focus, close, exit, detection, and move 
 
 Herdr hook processes can finish out of order. Beacon orders entries with Herdr's `state_change_seq` and keeps per-pane clear watermarks so a late completion hook cannot resurrect work that was already focused. State updates use a filesystem lock and atomic private files.
 
-Before every jump, Beacon reconciles the queue with `herdr agent list`. This recovers missed `done` agents, prunes stale entries, and rebases ordering after a Herdr server restart. Beacon does not reconstruct missing `blocked` entries because Herdr cannot distinguish a newly blocked agent from one the user already visited.
+Before every unread jump, Beacon reconciles the queue with `herdr agent list`. This recovers missed `done` agents, prunes stale entries, and rebases ordering after a Herdr server restart. Beacon does not reconstruct missing `blocked` entries because Herdr cannot distinguish a newly blocked agent from one the user already visited.
 
 Working-agent jumps read the same live agent list but never touch persisted queue state. Herdr's `state_change_seq` supplies the recency order, while the currently focused working pane acts as the cycle cursor.
 

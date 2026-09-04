@@ -10,24 +10,27 @@ use uuid::Uuid;
 
 use crate::herdr::{Herdr, HerdrClient};
 
-const KEY: &str = "alt+u";
-const COMMAND: &str = "shadowfax.beacon.jump-unread";
-const DESCRIPTION: &str = "Jump to newest unread agent";
+const UNREAD_KEY: &str = "alt+u";
+const UNREAD_COMMAND: &str = "shadowfax.beacon.jump-unread";
+const UNREAD_DESCRIPTION: &str = "Jump to newest unread agent";
 const WORKING_KEY: &str = "alt+o";
 const WORKING_COMMAND: &str = "shadowfax.beacon.jump-working";
 const WORKING_DESCRIPTION: &str = "Cycle through working agents";
 
+/// One direct Herdr shortcut owned and normalized by Beacon's installer.
 struct Binding {
     key: &'static str,
     command: &'static str,
     description: &'static str,
 }
 
+// This is the complete Beacon-owned set. Installation validates every destination
+// before rewriting either entry so a conflict cannot leave a partially upgraded config.
 const BINDINGS: [Binding; 2] = [
     Binding {
-        key: KEY,
-        command: COMMAND,
-        description: DESCRIPTION,
+        key: UNREAD_KEY,
+        command: UNREAD_COMMAND,
+        description: UNREAD_DESCRIPTION,
     },
     Binding {
         key: WORKING_KEY,
@@ -318,7 +321,7 @@ description = "Scratch"
             commands(&path),
             vec![
                 ("alt+i".into(), "shadowfax.scratch.toggle-nvim".into()),
-                (KEY.into(), COMMAND.into()),
+                (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
                 ("alt+o".into(), "shadowfax.beacon.jump-working".into(),),
             ]
         );
@@ -362,7 +365,7 @@ description = "Duplicate"
         assert_eq!(
             commands(&path),
             vec![
-                (KEY.into(), COMMAND.into()),
+                (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
                 (WORKING_KEY.into(), WORKING_COMMAND.into()),
             ]
         );
@@ -425,7 +428,7 @@ description = "Keep me"
         assert_eq!(
             commands(&path),
             vec![
-                (KEY.into(), COMMAND.into()),
+                (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
                 (WORKING_KEY.into(), WORKING_COMMAND.into()),
             ]
         );
