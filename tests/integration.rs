@@ -17,6 +17,8 @@ if [ "$1 $2" = "agent get" ]; then
 elif [ "$1 $2" = "agent list" ]; then
   if [ "$FAKE_AGENT_LIST" = "working" ]; then
     printf '%s\n' '{"id":"fake","result":{"type":"agent_list","agents":[{"terminal_id":"terminal-1","agent_status":"working","workspace_id":"w1","pane_id":"w1:p1","focused":true,"state_change_seq":10},{"terminal_id":"terminal-2","agent_status":"working","workspace_id":"w1","pane_id":"w1:p2","focused":false,"state_change_seq":8}]}}'
+  elif [ "$FAKE_AGENT_LIST" = "unread" ]; then
+    printf '%s\n' '{"result":{"agents":[{"terminal_id":"terminal-2","agent_status":"done","workspace_id":"w1","pane_id":"w1:p2","focused":false,"state_change_seq":8}]}}'
   else
     printf '%s\n' '{"id":"fake","result":{"type":"agent_list","agents":[]}}'
   fi
@@ -26,7 +28,13 @@ elif [ "$1 $2" = "agent focus" ]; then
     w1:p2) terminal=terminal-2; sequence=8 ;;
     *) exit 1 ;;
   esac
-  printf '{"id":"fake","result":{"type":"agent_focus","agent":{"terminal_id":"%s","agent_status":"working","workspace_id":"w1","pane_id":"%s","focused":true,"state_change_seq":%s}}}\n' "$terminal" "$3" "$sequence"
+  printf '{"id":"fake","result":{"type":"agent_focus","agent":{"terminal_id":"%s","agent_status":"working","workspace_id":"w1","tab_id":"w1:t9","pane_id":"%s","focused":true,"state_change_seq":%s}}}\n' "$terminal" "$3" "$sequence"
+elif [ "$1 $2" = "tab focus" ]; then
+  if [ "$FAKE_TAB_FOCUS_FAIL" = 1 ]; then
+    printf '%s\n' '{"error":{"code":"tab_not_found","message":"tab disappeared"}}' >&2
+    exit 1
+  fi
+  printf '%s\n' '{"result":{"type":"tab_focus"}}'
 elif [ "$1 $2" = "notification show" ]; then
   reason=${FAKE_NOTIFICATION_REASON:-shown}
   if [ "$reason" = shown ]; then shown=true; else shown=false; fi
@@ -121,7 +129,7 @@ fn working_jump_focuses_the_next_active_turn() {
     );
     assert_eq!(
         fs::read_to_string(log).unwrap(),
-        "agent list\nagent focus w1:p2\n"
+        "agent list\nagent focus w1:p2\ntab focus w1:t9\n"
     );
 }
 
@@ -149,8 +157,50 @@ fn working_jump_uses_action_context_before_server_focus_or_inherited_pane() {
     );
     assert_eq!(
         fs::read_to_string(log).unwrap(),
-        "agent list\nagent focus w1:p1\n"
+        "agent list\nagent focus w1:p1\ntab focus w1:t9\n"
     );
+}
+
+#[test]
+fn failed_tab_navigation_is_reported_by_both_shortcuts() {
+    for (action, agents) in [("jump-working", "working"), ("jump-unread", "unread")] {
+        let temporary = tempdir().unwrap();
+        let log = temporary.path().join("commands.log");
+        let state_dir = temporary.path().join("state");
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
+            .arg(action)
+            .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
+            .env("HERDR_PANE_ID", "w1:p1")
+            .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
+            .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+            .env("FAKE_AGENT_LIST", agents)
+            .env("FAKE_HERDR_LOG", &log)
+            .env("FAKE_TAB_FOCUS_FAIL", "1")
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "{action} must fail when the tab did not switch"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("tab_not_found"));
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            "agent list\nagent focus w1:p2\ntab focus w1:t9\n"
+        );
+        if action == "jump-unread" {
+            // No successful navigation means the jump itself must not acknowledge it.
+            assert_eq!(
+                StateStore::new(state_dir)
+                    .read()
+                    .unwrap()
+                    .newest()
+                    .unwrap()
+                    .pane_id,
+                "w1:p2"
+            );
+        }
+    }
 }
 
 #[test]

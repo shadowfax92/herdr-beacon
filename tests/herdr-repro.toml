@@ -1,0 +1,4 @@
+onboarding = false
+
+[terminal]
+default_shell = "/bin/sh"
