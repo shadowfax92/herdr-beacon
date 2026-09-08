@@ -81,7 +81,18 @@ impl HerdrClient for Herdr {
             .value
             .pointer("/result/agent")
             .context("Herdr agent focus response omitted result.agent")?;
-        parse_agent(agent)
+        let focused = parse_agent(agent)?;
+        let tab_id = agent
+            .get("tab_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .context("Herdr agent focus response omitted agent.tab_id")?;
+        // Herdr 0.9 agent.focus selects the runtime pane but does not navigate
+        // attached TUI clients. Explicit tab.focus projects that selection to
+        // their visible tab, even when the agent already reports focused=true.
+        let tab_focus = self.invoke(&strings(&["tab", "focus", tab_id]))?;
+        require_success(&tab_focus).context("failed to display the agent's tab")?;
+        Ok(focused)
     }
 
     fn notify(&self, title: &str, body: Option<&str>) -> Result<()> {

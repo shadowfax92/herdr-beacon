@@ -66,6 +66,8 @@ Before every unread jump, Beacon reconciles the queue with `herdr agent list`. T
 
 Working-agent jumps read the same live agent list but never touch persisted queue state. Herdr's `state_change_seq` supplies the recency order. The action's `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id` (or `HERDR_PANE_ID`) supplies the cycle cursor, rather than another client's server focus. Standalone commands without pane context fall back to API focus.
 
+Both shortcuts focus the agent and then explicitly focus its returned tab. Herdr 0.9's `agent focus` alone can report success without switching the visible TUI tab. The explicit tab focus also affects other TUI clients attached to the same server.
+
 In Herdr 0.9, API `done` uses server-side seen state, while each TUI tracks viewed completions independently. Beacon owns one shared unread queue per plugin state directory; it does not read those client-private acknowledgements. Merely viewing a visible split may therefore clear a sidebar badge without clearing Beacon's queue. No Herdr fork changes are required. See the [official API semantics](https://herdr.dev/docs/agent-automation/#choose-the-control-surface).
 
 ## Inspect and troubleshoot
@@ -85,6 +87,15 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
+```
+
+To verify actual TUI navigation with an installed Herdr (each run creates and stops its own isolated test server):
+
+```sh
+python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-working tab
+python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-unread tab
+python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-working workspace
+python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-unread workspace
 ```
 
 ## Remove
