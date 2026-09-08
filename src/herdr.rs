@@ -103,6 +103,14 @@ impl HerdrClient for Herdr {
                 .pointer("/result/reason")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            // Empty queues are successful navigation outcomes. Herdr may
+            // intentionally suppress their best-effort toast (e.g. rapid keys).
+            if matches!(
+                reason,
+                "disabled" | "rate_limited" | "no_foreground_client" | "busy"
+            ) {
+                return Ok(());
+            }
             bail!("Herdr did not show the notification: {reason}");
         }
         Ok(())

@@ -92,8 +92,8 @@ pub fn handle_event_json(
         }
         "pane.moved" => {
             let data = parse_data::<MovedData>(envelope.data)?;
-            let live = herdr.agent_get(&data.pane.pane_id)?;
             store.update(|state| {
+                let live = herdr.agent_get(&data.pane.pane_id)?;
                 state.move_pane(
                     &data.previous_pane_id,
                     &data.pane.pane_id,
@@ -114,13 +114,18 @@ fn observe_live(
     herdr: &impl HerdrClient,
     store: &StateStore,
     pane_id: &str,
-    force_focused: bool,
+    explicit_focus: bool,
 ) -> Result<()> {
-    let observation = herdr.agent_get(pane_id)?;
     store.update(|state| {
-        if let Some(mut observation) = observation {
-            observation.focused |= force_focused;
-            state.observe(observation, ObservationSource::Event);
+        // Hooks run in separate processes. Fetch under the same lock as the
+        // mutation so a delayed hook cannot apply an older live snapshot.
+        if let Some(observation) = herdr.agent_get(pane_id)? {
+            let source = if explicit_focus {
+                ObservationSource::Focus
+            } else {
+                ObservationSource::Event
+            };
+            state.observe(observation, source);
         } else {
             state.remove_pane(pane_id);
         }
@@ -129,11 +134,10 @@ fn observe_live(
 }
 
 fn remove_if_missing(herdr: &impl HerdrClient, store: &StateStore, pane_id: &str) -> Result<()> {
-    if herdr.agent_get(pane_id)?.is_some() {
-        return Ok(());
-    }
     store.update(|state| {
-        state.remove_pane(pane_id);
+        if herdr.agent_get(pane_id)?.is_none() {
+            state.remove_pane(pane_id);
+        }
         Ok(())
     })
 }
