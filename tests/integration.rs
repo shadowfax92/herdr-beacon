@@ -21,9 +21,16 @@ elif [ "$1 $2" = "agent list" ]; then
     printf '%s\n' '{"id":"fake","result":{"type":"agent_list","agents":[]}}'
   fi
 elif [ "$1 $2" = "agent focus" ]; then
-  printf '%s\n' '{"id":"fake","result":{"type":"agent_focus","agent":{"terminal_id":"terminal-2","agent_status":"working","workspace_id":"w1","pane_id":"w1:p2","focused":true,"state_change_seq":8}}}'
+  case "$3" in
+    w1:p1) terminal=terminal-1; sequence=10 ;;
+    w1:p2) terminal=terminal-2; sequence=8 ;;
+    *) exit 1 ;;
+  esac
+  printf '{"id":"fake","result":{"type":"agent_focus","agent":{"terminal_id":"%s","agent_status":"working","workspace_id":"w1","pane_id":"%s","focused":true,"state_change_seq":%s}}}\n' "$terminal" "$3" "$sequence"
 elif [ "$1 $2" = "notification show" ]; then
-  printf '%s\n' '{"id":"fake","result":{"type":"notification_show","shown":true,"reason":"shown"}}'
+  reason=${FAKE_NOTIFICATION_REASON:-shown}
+  if [ "$reason" = shown ]; then shown=true; else shown=false; fi
+  printf '{"id":"fake","result":{"type":"notification_show","shown":%s,"reason":"%s"}}\n' "$shown" "$reason"
 else
   printf '%s\n' '{"id":"fake","error":{"code":"unexpected","message":"unexpected command"}}' >&2
   exit 1
@@ -99,6 +106,8 @@ fn working_jump_focuses_the_next_active_turn() {
     let log = temporary.path().join("commands.log");
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
         .arg("jump-working")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
         .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
         .env("FAKE_AGENT_LIST", "working")
         .env("FAKE_HERDR_LOG", &log)
@@ -114,4 +123,72 @@ fn working_jump_focuses_the_next_active_turn() {
         fs::read_to_string(log).unwrap(),
         "agent list\nagent focus w1:p2\n"
     );
+}
+
+#[test]
+fn working_jump_uses_action_context_before_server_focus_or_inherited_pane() {
+    let temporary = tempdir().unwrap();
+    let log = temporary.path().join("commands.log");
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
+        .arg("jump-working")
+        .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"focused_pane_id":"w1:p2"}"#,
+        )
+        .env("FAKE_AGENT_LIST", "working")
+        .env("FAKE_HERDR_LOG", &log)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        "agent list\nagent focus w1:p1\n"
+    );
+}
+
+#[test]
+fn suppressed_empty_queue_notifications_are_successful_no_ops() {
+    for action in ["jump-unread", "jump-working"] {
+        for reason in ["rate_limited", "disabled", "busy", "no_foreground_client"] {
+            let temporary = tempdir().unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
+                .arg(action)
+                .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+                .env("HERDR_PLUGIN_STATE_DIR", temporary.path().join("state"))
+                .env("FAKE_HERDR_LOG", temporary.path().join("commands.log"))
+                .env("FAKE_AGENT_LIST", "empty")
+                .env("FAKE_NOTIFICATION_REASON", reason)
+                .output()
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "{action}/{reason}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_notification_failures_are_not_silenced() {
+    let temporary = tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
+        .arg("jump-working")
+        .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("FAKE_HERDR_LOG", temporary.path().join("commands.log"))
+        .env("FAKE_AGENT_LIST", "empty")
+        .env("FAKE_NOTIFICATION_REASON", "unexpected_failure")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected_failure"));
 }

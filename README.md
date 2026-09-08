@@ -12,11 +12,12 @@
 
 Beacon remembers background agents that finish or need input. Press `Alt-u` to focus the newest unread agent; press it again for the next one. Press `Alt-o` to cycle through agents that are currently working, ordered by the most recently started turn.
 
-- `done` is unread because Herdr uses that status for unseen background completion.
-- `blocked` becomes unread when Beacon observes the agent waiting in the background.
-- Focusing the pane marks its Beacon entry read.
-- Closed, exited, running, idle, and missing agents are removed automatically.
-- An empty queue shows `No unread agents` with `--sound none`.
+- A new completion (`idle` or `done`) becomes unread when its state-change sequence advances beyond Beacon's last observation or acknowledgement.
+- An agent first encountered as `idle` establishes a baseline, not an unread entry. Existing `done` agents can seed the queue.
+- `blocked` becomes unread on a status hook or a newly observed transition; existing blocked agents are not added blindly at startup.
+- A pane-focus event, successful unread jump, or invoking `Alt-u` from a pane marks its Beacon entry read.
+- Closed, exited, running, unknown, and missing agents are removed automatically.
+- An empty queue requests a soundless notification. Herdr may suppress it without making the shortcut fail.
 - Working-agent navigation is live and does not add to or consume the unread queue.
 - From outside the working set, `Alt-o` starts with the newest turn; repeated presses advance and wrap.
 
@@ -59,11 +60,13 @@ herdr plugin action invoke shadowfax.beacon.install-keybindings
 
 Herdr runs Beacon on agent-status, pane-focus, close, exit, detection, and move events. Beacon validates each event against the live `herdr agent` record, then stores only pane identity, attention status, and ordering metadata in its private plugin state directory.
 
-Herdr hook processes can finish out of order. Beacon orders entries with Herdr's `state_change_seq` and keeps per-pane clear watermarks so a late completion hook cannot resurrect work that was already focused. State updates use a filesystem lock and atomic private files.
+Herdr hook processes can finish out of order. Beacon orders entries with Herdr's `state_change_seq` and keeps per-terminal acknowledgement watermarks so a late completion hook cannot resurrect work that was already focused. Live API reads and state updates share a filesystem lock; state is saved in atomic private files. Existing v1 state files remain compatible.
 
-Before every unread jump, Beacon reconciles the queue with `herdr agent list`. This recovers missed `done` agents, prunes stale entries, and rebases ordering after a Herdr server restart. Beacon does not reconstruct missing `blocked` entries because Herdr cannot distinguish a newly blocked agent from one the user already visited.
+Before every unread jump, Beacon reconciles the queue with `herdr agent list`. This recovers newer settled transitions even when a hook was missed, prunes stale entries, and rebases ordering after a Herdr server sequence reset. An unchanged `done` or `blocked` status cannot override Beacon's acknowledgement. Fresh idle/blocked snapshots are baselined rather than guessed to be unread.
 
-Working-agent jumps read the same live agent list but never touch persisted queue state. Herdr's `state_change_seq` supplies the recency order, while the currently focused working pane acts as the cycle cursor.
+Working-agent jumps read the same live agent list but never touch persisted queue state. Herdr's `state_change_seq` supplies the recency order. The action's `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id` (or `HERDR_PANE_ID`) supplies the cycle cursor, rather than another client's server focus. Standalone commands without pane context fall back to API focus.
+
+In Herdr 0.9, API `done` uses server-side seen state, while each TUI tracks viewed completions independently. Beacon owns one shared unread queue per plugin state directory; it does not read those client-private acknowledgements. Merely viewing a visible split may therefore clear a sidebar badge without clearing Beacon's queue. No Herdr fork changes are required. See the [official API semantics](https://herdr.dev/docs/agent-automation/#choose-the-control-surface).
 
 ## Inspect and troubleshoot
 

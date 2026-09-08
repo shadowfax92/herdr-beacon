@@ -16,8 +16,10 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
-    pub fn needs_attention(self) -> bool {
-        matches!(self, Self::Blocked | Self::Done)
+    /// A lifecycle state that can require attention; the ledger must still check
+    /// bootstrap and acknowledgement sequences before treating it as unread.
+    pub fn can_need_attention(self) -> bool {
+        matches!(self, Self::Idle | Self::Blocked | Self::Done)
     }
 }
 
@@ -25,6 +27,8 @@ impl AgentStatus {
 pub enum ObservationSource {
     Event,
     Reconcile,
+    /// An explicit focus hook or a successful navigation, not API `focused`.
+    Focus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +59,9 @@ struct Watermark {
     state_change_seq: u64,
 }
 
+/// Beacon's unread ledger. Entries are pending transitions; watermarks are the
+/// last acknowledged or non-attention sequence for each terminal identity.
+/// Herdr's server-side `seen`/`focused` flags do not own these acknowledgements.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BeaconState {
@@ -78,20 +85,31 @@ impl Default for BeaconState {
 impl BeaconState {
     pub fn observe(&mut self, observation: AgentObservation, source: ObservationSource) {
         let reconciled = source == ObservationSource::Reconcile;
-        if observation.focused || !observation.status.needs_attention() {
+        let known_sequence = self.known_sequence(&observation);
+        if known_sequence.is_some_and(|sequence| observation.state_change_seq < sequence) {
+            if !reconciled {
+                return;
+            }
+            // A fresh list is read under the state lock. A lower sequence here
+            // means the server restarted; do not compare two sequence epochs.
+            self.entries.remove(&observation.pane_id);
+            self.watermarks.remove(&observation.pane_id);
+        }
+        if source == ObservationSource::Focus || !observation.status.can_need_attention() {
             self.clear_observation(&observation, reconciled);
             return;
         }
 
-        if observation.status == AgentStatus::Blocked
-            && reconciled
-            && !self.entry_matches(&observation)
+        // Idle and done are the same lifecycle state in the API. Only a newer
+        // sequence is a new completion; an idle agent first seen at startup is
+        // a baseline, not invented unread work. Existing done remains a useful
+        // bootstrap hint, and blocked is bootstrapped only by an actual hook.
+        let first_observation = self.known_sequence(&observation).is_none();
+        if first_observation
+            && (observation.status == AgentStatus::Idle
+                || (observation.status == AgentStatus::Blocked && reconciled))
         {
-            self.rebase_watermark(
-                &observation.pane_id,
-                &observation.terminal_id,
-                observation.state_change_seq,
-            );
+            self.clear_observation(&observation, reconciled);
             return;
         }
 
@@ -163,17 +181,24 @@ impl BeaconState {
         Ok(())
     }
 
-    fn entry_matches(&self, observation: &AgentObservation) -> bool {
-        self.entries
+    fn known_sequence(&self, observation: &AgentObservation) -> Option<u64> {
+        let entry = self
+            .entries
             .get(&observation.pane_id)
-            .is_some_and(|entry| entry.terminal_id == observation.terminal_id)
+            .filter(|entry| entry.terminal_id == observation.terminal_id)
+            .map(|entry| entry.state_change_seq);
+        let watermark = self
+            .watermarks
+            .get(&observation.pane_id)
+            .filter(|watermark| watermark.terminal_id == observation.terminal_id)
+            .map(|watermark| watermark.state_change_seq);
+        entry.into_iter().chain(watermark).max()
     }
 
     fn record_attention(&mut self, observation: AgentObservation, reconciled: bool) {
         if let Some(watermark) = self.watermarks.get(&observation.pane_id) {
             if watermark.terminal_id == observation.terminal_id
                 && observation.state_change_seq <= watermark.state_change_seq
-                && !reconciled
             {
                 return;
             }
@@ -294,6 +319,116 @@ mod tests {
     }
 
     #[test]
+    fn new_idle_completion_survives_server_focus_and_reconciliation() {
+        let mut state = BeaconState::default();
+        state.observe(
+            observation("w1:p1", "t1", AgentStatus::Working, 8),
+            ObservationSource::Event,
+        );
+        let mut idle = observation("w1:p1", "t1", AgentStatus::Idle, 9);
+        // Server focus is not the calling client's acknowledgement in Herdr 0.9.
+        idle.focused = true;
+        state.observe(idle.clone(), ObservationSource::Event);
+        state.observe(idle, ObservationSource::Reconcile);
+
+        assert_eq!(state.newest().unwrap().state_change_seq, 9);
+    }
+
+    #[test]
+    fn initial_idle_is_a_baseline_but_a_new_idle_sequence_is_unread() {
+        let mut state = BeaconState::default();
+        let idle = observation("w1:p1", "t1", AgentStatus::Idle, 8);
+        state.observe(idle.clone(), ObservationSource::Event);
+        state.observe(idle, ObservationSource::Reconcile);
+        assert!(state.newest().is_none());
+
+        // Recover a completed turn even if its intermediate working hook was missed.
+        state.observe(
+            observation("w1:p1", "t1", AgentStatus::Idle, 10),
+            ObservationSource::Reconcile,
+        );
+        assert_eq!(state.newest().unwrap().state_change_seq, 10);
+    }
+
+    #[test]
+    fn focus_acknowledgement_survives_idle_done_label_changes() {
+        let mut state = BeaconState::default();
+        let done = observation("w1:p1", "t1", AgentStatus::Done, 9);
+        state.observe(done.clone(), ObservationSource::Event);
+        state.observe(done.clone(), ObservationSource::Focus);
+        for source in [ObservationSource::Event, ObservationSource::Reconcile] {
+            for status in [AgentStatus::Idle, AgentStatus::Done] {
+                state.observe(
+                    AgentObservation {
+                        status,
+                        ..done.clone()
+                    },
+                    source,
+                );
+                assert!(state.newest().is_none());
+            }
+        }
+        state.observe(
+            observation("w1:p1", "t1", AgentStatus::Idle, 11),
+            ObservationSource::Event,
+        );
+        assert_eq!(state.newest().unwrap().state_change_seq, 11);
+    }
+
+    #[test]
+    fn new_terminal_idle_does_not_inherit_old_completion_history() {
+        let mut state = BeaconState::default();
+        state.observe(
+            observation("w1:p1", "old", AgentStatus::Done, 8),
+            ObservationSource::Event,
+        );
+        state.observe(
+            observation("w1:p1", "new", AgentStatus::Idle, 10),
+            ObservationSource::Reconcile,
+        );
+        assert!(state.newest().is_none());
+    }
+
+    #[test]
+    fn moved_acknowledgement_prevents_resurrecting_the_same_completion() {
+        let mut state = BeaconState::default();
+        state.observe(
+            observation("w1:p1", "t1", AgentStatus::Done, 8),
+            ObservationSource::Focus,
+        );
+        state.move_pane("w1:p1", "w2:p4", "w2", "t1");
+        state.observe(
+            observation("w2:p4", "t1", AgentStatus::Done, 8),
+            ObservationSource::Reconcile,
+        );
+        assert!(state.newest().is_none());
+    }
+
+    #[test]
+    fn existing_v1_state_preserves_pending_and_acknowledged_completions() {
+        let mut state: BeaconState = serde_json::from_str(
+            r#"{
+            "version": 1, "next_ordinal": 1,
+            "entries": {"w1:p1": {"pane_id": "w1:p1", "terminal_id": "t1",
+                "workspace_id": "w1", "status": "done", "state_change_seq": 8, "ordinal": 1}},
+            "watermarks": {"w1:p2": {"terminal_id": "t2", "state_change_seq": 9}}
+        }"#,
+        )
+        .unwrap();
+        state.validate().unwrap();
+        state.observe(
+            observation("w1:p1", "t1", AgentStatus::Idle, 8),
+            ObservationSource::Reconcile,
+        );
+        state.observe(
+            observation("w1:p2", "t2", AgentStatus::Done, 9),
+            ObservationSource::Reconcile,
+        );
+        assert_eq!(state.entries().len(), 1);
+        assert_eq!(state.newest().unwrap().pane_id, "w1:p1");
+    }
+
+    #[test]
     fn newest_attention_uses_herdr_sequence_then_local_order() {
         let mut state = BeaconState::default();
         state.observe(
@@ -324,7 +459,7 @@ mod tests {
         let mut focused = done.clone();
         focused.focused = true;
         focused.status = AgentStatus::Idle;
-        state.observe(focused, ObservationSource::Event);
+        state.observe(focused, ObservationSource::Focus);
         state.observe(done, ObservationSource::Event);
 
         assert!(state.newest().is_none());
@@ -343,7 +478,7 @@ mod tests {
         state.observe(old.clone(), ObservationSource::Event);
         let mut focused = old;
         focused.focused = true;
-        state.observe(focused, ObservationSource::Event);
+        state.observe(focused, ObservationSource::Focus);
 
         state.observe(
             observation("w1:p1", "new", AgentStatus::Done, 1),
@@ -354,13 +489,13 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_recovers_done_but_not_unseen_blocked_entries() {
+    fn reconciliation_does_not_resurrect_acknowledged_done_or_bootstrap_blocked() {
         let mut state = BeaconState::default();
         let done = observation("w1:p1", "t1", AgentStatus::Done, 7);
         state.observe(done.clone(), ObservationSource::Event);
         let mut focused = done.clone();
         focused.focused = true;
-        state.observe(focused, ObservationSource::Event);
+        state.observe(focused, ObservationSource::Focus);
 
         state.observe(done, ObservationSource::Reconcile);
         state.observe(
@@ -368,7 +503,11 @@ mod tests {
             ObservationSource::Reconcile,
         );
 
-        assert_eq!(state.entries().len(), 1);
+        assert!(state.entries().is_empty());
+        state.observe(
+            observation("w1:p1", "t1", AgentStatus::Done, 9),
+            ObservationSource::Reconcile,
+        );
         assert_eq!(state.newest().unwrap().pane_id, "w1:p1");
     }
 
@@ -409,7 +548,7 @@ mod tests {
         state.observe(old.clone(), ObservationSource::Event);
         let mut seen = old;
         seen.focused = true;
-        state.observe(seen, ObservationSource::Event);
+        state.observe(seen, ObservationSource::Focus);
 
         state.observe(
             observation("w1:p1", "t1", AgentStatus::Blocked, 1),
