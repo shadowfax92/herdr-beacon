@@ -23,7 +23,9 @@ Beacon remembers background agents that finish or need input. Press `Alt-u` to f
 
 ## Install
 
-Requires macOS, Herdr 0.7.5 or newer, and a Rust toolchain.
+Requires macOS or Linux (including WSL), Herdr 0.7.5 or newer, and a Rust toolchain.
+
+On Windows, run Herdr and this plugin inside WSL. Native Windows is not supported.
 
 ```sh
 herdr plugin install shadowfax92/herdr-beacon --yes

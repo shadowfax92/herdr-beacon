@@ -3,7 +3,7 @@ name = "Beacon"
 version = "0.1.0"
 min_herdr_version = "0.7.5"
 description = "Jump to unread agents or cycle through active turns in Herdr."
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 [[build]]
 command = ["cargo", "build", "--release", "--locked"]
