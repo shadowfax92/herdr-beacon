@@ -25,7 +25,8 @@ import time
 beacon = str(Path(sys.argv[1]).resolve())
 action, destination = sys.argv[2:4]
 assert action in ("jump-working", "jump-unread", "jump-recent", "jump-recent-reverse")
-status = sys.argv[4] if len(sys.argv) > 4 else None
+recent = action in ("jump-recent", "jump-recent-reverse")
+status = sys.argv[4] if len(sys.argv) > 4 else ("idle" if recent else None)
 assert destination in ("tab", "workspace")
 herdr = shutil.which("herdr")
 assert herdr, "Herdr must be installed"
@@ -108,8 +109,16 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
             # middle, target (oldest). Reverse must wrap origin -> target.
             middle = cli("tab", "create", "--label", "middle", "--no-focus")["result"]["root_pane"]["pane_id"]
             cli("pane", "report-agent", middle, "--agent", "codex", "--state", "working", "--source", "beacon:repro")
+            cli("pane", "report-agent", middle, "--agent", "codex", "--state", "idle", "--source", "beacon:repro")
             cli("pane", "run", origin, "printf 'BEACON_ORIGIN_VISIBLE\\n'")
             cli("pane", "report-agent", origin, "--agent", "codex", "--state", "working", "--source", "beacon:repro")
+            cli("pane", "report-agent", origin, "--agent", "codex", "--state", "idle", "--source", "beacon:repro")
+        if recent:
+            # Newer busy agents would intercept either direction without filtering.
+            # Keep them live to verify that both quote shortcuts skip those states.
+            for busy_status in ("working", "blocked"):
+                busy = cli("tab", "create", "--label", busy_status, "--no-focus")["result"]["root_pane"]["pane_id"]
+                cli("pane", "report-agent", busy, "--agent", "codex", "--state", busy_status, "--source", "beacon:repro")
         assert "BEACON_CROSS_TAB_VISIBLE" not in frame(), "target was visible before navigation"
         if shortcut:
             encoding = os.environ.get("BEACON_TEST_KEY_ENCODING", "legacy")

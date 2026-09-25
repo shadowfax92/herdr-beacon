@@ -66,50 +66,57 @@ fn is_current(agent: &crate::model::AgentObservation, current_pane: Option<&str>
     current_pane.map_or(agent.focused, |pane| agent.pane_id == pane)
 }
 
-/// Advances through live working agents without changing Beacon's unread queue.
-/// Herdr's status sequence supplies a cross-workspace recency order; the focused
-/// working pane is the cursor so repeated invocations visit every active turn.
+/// Advances through working and blocked agents without directly changing the unread queue.
+/// Herdr's status sequence supplies a cross-workspace recency order; the current
+/// eligible pane is the cursor, so every active or waiting turn is reachable.
 pub fn jump_working(herdr: &impl HerdrClient, current_pane: Option<&str>) -> Result<JumpOutcome> {
-    let working = herdr
+    let active_turns = herdr
         .agent_list()?
         .into_iter()
-        .filter(|agent| agent.status == AgentStatus::Working)
+        .filter(is_active_turn)
         .collect();
     jump_in_activity_order(
         herdr,
-        working,
+        active_turns,
         current_pane,
-        "No working agents",
+        "No working or blocked agents",
         Direction::Forward,
     )
 }
 
-/// Visits every live agent, regardless of status, newest activity first. Reading
-/// the live sequence avoids a second persistent history and does not rank the
-/// navigation itself as activity. Normal focus hooks still acknowledge unread work.
+/// Working and blocked turns belong to Alt-O. Both recent-activity directions
+/// use its complement, leaving unread completions eligible without consulting or
+/// mutating the unread ledger. Normal focus hooks still acknowledge viewed work.
+fn is_active_turn(agent: &AgentObservation) -> bool {
+    matches!(agent.status, AgentStatus::Working | AgentStatus::Blocked)
+}
+
 pub fn jump_recent(herdr: &impl HerdrClient, current_pane: Option<&str>) -> Result<JumpOutcome> {
-    jump_in_activity_order(
-        herdr,
-        herdr.agent_list()?,
-        current_pane,
-        "No agents",
-        Direction::Forward,
-    )
+    jump_recent_in_direction(herdr, current_pane, Direction::Forward)
 }
 
-/// Walks back toward newer activity in the same ring as `jump_recent`. From
-/// outside the live agent set, reverse navigation enters at the oldest agent.
+/// Walks back toward newer activity in the same filtered ring as `jump_recent`.
+/// From a working/blocked pane or non-agent pane, start at the oldest eligible agent.
 pub fn jump_recent_reverse(
     herdr: &impl HerdrClient,
     current_pane: Option<&str>,
 ) -> Result<JumpOutcome> {
-    jump_in_activity_order(
-        herdr,
-        herdr.agent_list()?,
-        current_pane,
-        "No agents",
-        Direction::Backward,
-    )
+    jump_recent_in_direction(herdr, current_pane, Direction::Backward)
+}
+
+fn jump_recent_in_direction(
+    herdr: &impl HerdrClient,
+    current_pane: Option<&str>,
+    direction: Direction,
+) -> Result<JumpOutcome> {
+    // Membership is refreshed for every press: a newly completed turn joins the
+    // cycle immediately, and an agent that resumes work or blocks leaves it.
+    let agents = herdr
+        .agent_list()?
+        .into_iter()
+        .filter(|agent| !is_active_turn(agent))
+        .collect();
+    jump_in_activity_order(herdr, agents, current_pane, "No eligible agents", direction)
 }
 
 fn jump_in_activity_order(
@@ -379,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_jump_visits_every_status_in_activity_order_and_wraps() {
+    fn recent_jump_skips_working_and_blocked_but_keeps_unread_completions() {
         let fake = FakeHerdr::new(vec![
             agent("w1:p1", AgentStatus::Idle, 8),
             agent("w2:p1", AgentStatus::Blocked, 12),
@@ -388,7 +395,7 @@ mod tests {
             agent("w5:p1", AgentStatus::Working, 14),
         ]);
         let mut current = "outside".to_string();
-        for expected in ["w5:p1", "w2:p1", "w3:p1", "w1:p1", "w4:p1", "w5:p1"] {
+        for expected in ["w3:p1", "w1:p1", "w4:p1", "w3:p1"] {
             assert_eq!(
                 jump_recent(&fake, Some(&current)).unwrap(),
                 JumpOutcome::Focused(expected.to_string())
@@ -402,8 +409,8 @@ mod tests {
         let fake = FakeHerdr::new(vec![
             agent("w3:p1", AgentStatus::Done, 10),
             agent("w1:p1", AgentStatus::Idle, 8),
-            agent("w2:p1", AgentStatus::Blocked, 10),
-            agent("w5:p1", AgentStatus::Working, 14),
+            agent("w2:p1", AgentStatus::Idle, 10),
+            agent("w5:p1", AgentStatus::Done, 14),
             agent("w4:p1", AgentStatus::Unknown, 6),
         ]);
         for current in &fake.agents {
@@ -428,7 +435,7 @@ mod tests {
 
     #[test]
     fn reverse_recent_jump_respects_invoking_pane_and_handles_empty_single_and_errors() {
-        let mut server_focused = agent("w1:p1", AgentStatus::Working, 12);
+        let mut server_focused = agent("w1:p1", AgentStatus::Done, 12);
         server_focused.focused = true;
         let fake = FakeHerdr::new(vec![
             server_focused.clone(),
@@ -447,7 +454,7 @@ mod tests {
             jump_recent_reverse(&fake, None).unwrap(),
             JumpOutcome::Empty
         );
-        assert_eq!(*fake.notifications.lock().unwrap(), ["No agents"]);
+        assert_eq!(*fake.notifications.lock().unwrap(), ["No eligible agents"]);
         let mut fake = FakeHerdr::new(vec![server_focused]);
         assert_eq!(
             jump_recent_reverse(&fake, Some("w1:p1")).unwrap(),
@@ -459,12 +466,12 @@ mod tests {
 
     #[test]
     fn recent_jump_uses_invoking_pane_with_stable_ties() {
-        let mut server_focused = agent("w1:p1", AgentStatus::Working, 0);
+        let mut server_focused = agent("w1:p1", AgentStatus::Done, 0);
         server_focused.focused = true;
         let fake = FakeHerdr::new(vec![
             agent("w3:p1", AgentStatus::Idle, 0),
             server_focused,
-            agent("w2:p1", AgentStatus::Blocked, 0),
+            agent("w2:p1", AgentStatus::Idle, 0),
         ]);
         assert_eq!(
             jump_recent(&fake, Some("w2:p1")).unwrap(),
@@ -480,7 +487,7 @@ mod tests {
     fn recent_jump_handles_no_agents_and_propagates_focus_failure() {
         let fake = FakeHerdr::new(vec![]);
         assert_eq!(jump_recent(&fake, None).unwrap(), JumpOutcome::Empty);
-        assert_eq!(*fake.notifications.lock().unwrap(), ["No agents"]);
+        assert_eq!(*fake.notifications.lock().unwrap(), ["No eligible agents"]);
         let mut fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Unknown, 8)]);
         assert_eq!(
             jump_recent(&fake, Some("w1:p1")).unwrap(),
@@ -488,6 +495,73 @@ mod tests {
         );
         fake.focus_error = true;
         assert!(jump_recent(&fake, None).is_err());
+    }
+
+    #[test]
+    fn recent_directions_enter_from_excluded_agents_and_refresh_membership() {
+        let mut fake = FakeHerdr::new(vec![
+            agent("w1:p1", AgentStatus::Working, 14),
+            agent("w2:p1", AgentStatus::Blocked, 12),
+            agent("w3:p1", AgentStatus::Done, 10),
+            agent("w4:p1", AgentStatus::Idle, 8),
+        ]);
+        assert_eq!(
+            jump_recent(&fake, Some("w1:p1")).unwrap(),
+            JumpOutcome::Focused("w3:p1".into())
+        );
+        assert_eq!(
+            jump_recent_reverse(&fake, Some("w2:p1")).unwrap(),
+            JumpOutcome::Focused("w4:p1".into())
+        );
+        // Finishing a turn adds it immediately; starting work removes a candidate.
+        fake.agents[0].status = AgentStatus::Idle;
+        fake.agents[0].state_change_seq = 15;
+        fake.agents[2].status = AgentStatus::Working;
+        assert_eq!(
+            jump_recent(&fake, Some("w3:p1")).unwrap(),
+            JumpOutcome::Focused("w1:p1".into())
+        );
+        assert_eq!(
+            jump_recent_reverse(&fake, Some("w4:p1")).unwrap(),
+            JumpOutcome::Focused("w1:p1".into())
+        );
+    }
+
+    #[test]
+    fn recent_directions_do_not_focus_when_all_agents_are_working_or_blocked() {
+        let fake = FakeHerdr::new(vec![
+            agent("w1:p1", AgentStatus::Working, 14),
+            agent("w2:p1", AgentStatus::Blocked, 12),
+        ]);
+        assert_eq!(jump_recent(&fake, None).unwrap(), JumpOutcome::Empty);
+        assert_eq!(
+            jump_recent_reverse(&fake, None).unwrap(),
+            JumpOutcome::Empty
+        );
+        assert!(fake.focused.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn working_cycle_includes_blockers_and_excludes_finished_or_unknown_agents() {
+        let fake = FakeHerdr::new(vec![
+            agent("w1:p1", AgentStatus::Working, 14),
+            agent("w2:p1", AgentStatus::Blocked, 12),
+            agent("w3:p1", AgentStatus::Done, 20),
+            agent("w4:p1", AgentStatus::Idle, 18),
+            agent("w5:p1", AgentStatus::Unknown, 16),
+        ]);
+        assert_eq!(
+            jump_working(&fake, Some("w3:p1")).unwrap(),
+            JumpOutcome::Focused("w1:p1".into())
+        );
+        assert_eq!(
+            jump_working(&fake, Some("w1:p1")).unwrap(),
+            JumpOutcome::Focused("w2:p1".into())
+        );
+        assert_eq!(
+            jump_working(&fake, Some("w2:p1")).unwrap(),
+            JumpOutcome::Focused("w1:p1".into())
+        );
     }
 
     #[test]
@@ -571,7 +645,10 @@ mod tests {
 
         assert_eq!(outcome, JumpOutcome::Empty);
         assert!(fake.focused.lock().unwrap().is_empty());
-        assert_eq!(*fake.notifications.lock().unwrap(), ["No working agents"]);
+        assert_eq!(
+            *fake.notifications.lock().unwrap(),
+            ["No working or blocked agents"]
+        );
     }
 
     #[test]

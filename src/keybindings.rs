@@ -15,14 +15,15 @@ const UNREAD_COMMAND: &str = "shadowfax.beacon.jump-unread";
 const UNREAD_DESCRIPTION: &str = "Cycle through unread or blocked agents";
 const WORKING_KEY: &str = "alt+o";
 const WORKING_COMMAND: &str = "shadowfax.beacon.jump-working";
-const WORKING_DESCRIPTION: &str = "Cycle through working agents";
+const WORKING_DESCRIPTION: &str = "Cycle through working or blocked agents";
 const RECENT_KEY: &str = "alt+quote";
 const RECENT_COMMAND: &str = "shadowfax.beacon.jump-recent";
-const RECENT_DESCRIPTION: &str = "Cycle through all agents by recent activity";
+const RECENT_DESCRIPTION: &str = "Cycle through idle, done, or unknown agents by recent activity";
 const REVERSE_KEY: &str = "alt+shift+quote";
 const REVERSE_LEGACY_KEY: &str = "alt+double_quote";
 const REVERSE_COMMAND: &str = "shadowfax.beacon.jump-recent-reverse";
-const REVERSE_DESCRIPTION: &str = "Cycle backward through all agents by recent activity";
+const REVERSE_DESCRIPTION: &str =
+    "Cycle backward through idle, done, or unknown agents by recent activity";
 
 /// One direct Herdr shortcut owned and normalized by Beacon's installer.
 struct Binding {
