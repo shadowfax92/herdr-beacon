@@ -15,11 +15,11 @@ Beacon remembers background agents that finish and keeps blocked requests within
 | Shortcut | Agents included | Order |
 | --- | --- | --- |
 | `Alt-u` | Unread completions and all blocked agents, including ones already viewed | Most recent activity first |
-| `Alt-o` | Currently working agents | Most recently started turn first |
-| `Alt-'` | Every live agent: working, blocked, done, idle, and unknown | Most recent activity first |
+| `Alt-o` | Working and blocked agents | Most recent activity first |
+| `Alt-'` | Idle, done, and unknown agents, including unread completions | Most recent activity first |
 | `Shift-Alt-'` | The same agents | One step backward in that order |
 
-Repeated presses advance from the current agent and wrap at the end. `Alt-u` retains your current pane's position after reading its completion, so newer blockers do not get repeated before older requests. `Alt-o` starts with the newest working turn when you are outside the working set; `Alt-'` starts with the newest agent when you are outside the agent set. `Shift-Alt-'` steps toward newer activity and wraps from newest to oldest; when outside the agent set it starts at the oldest. Forward and reverse undo each other while the live activity order is unchanged. Activity means Herdr's latest lifecycle transition (`state_change_seq`), not how often you focus a pane. Ties use pane ID, and each press refreshes the live order.
+Repeated presses advance from the current agent and wrap at the end. `Alt-u` retains your current pane's position after reading its completion, so newer blockers do not get repeated before older requests. `Alt-o` starts with the newest working or blocked turn when you are outside the working/blocked set; `Alt-'` starts with the newest agent when you are outside the eligible set. `Shift-Alt-'` steps toward newer activity and wraps from newest to oldest; when outside the eligible set it starts at the oldest. Forward and reverse undo each other while the live activity order is unchanged. Activity means Herdr's latest lifecycle transition (`state_change_seq`), not how often you focus a pane. Ties use pane ID, and each press refreshes the live order.
 
 - A new completion (`idle` or `done`) becomes unread when its state-change sequence advances beyond Beacon's last observation or acknowledgement.
 - An agent first encountered as `idle` establishes a baseline, not an unread entry. Existing `done` agents can seed the queue.
@@ -28,7 +28,7 @@ Repeated presses advance from the current agent and wrap at the end. `Alt-u` ret
 - Closed, exited, running, unknown, and missing agents are removed from the unread queue automatically.
 - With no other unread or blocked destination, `Alt-u` requests a soundless notification. Herdr may suppress it without making the shortcut fail.
 - Working and recent-activity navigation read the live agent list without directly changing queue state; normal focus hooks still acknowledge viewed work.
-- From outside the working set, `Alt-o` starts with the newest turn; repeated presses advance and wrap.
+- `Alt-o` covers working and blocked agents. `Alt-'` and `Shift-Alt-'` skip both states and refresh their membership on every press.
 
 ## Install
 
@@ -54,26 +54,26 @@ description = "Cycle through unread or blocked agents"
 key = "alt+o"
 type = "plugin_action"
 command = "shadowfax.beacon.jump-working"
-description = "Cycle through working agents"
+description = "Cycle through working or blocked agents"
 
 [[keys.command]]
 key = "alt+quote"
 type = "plugin_action"
 command = "shadowfax.beacon.jump-recent"
-description = "Cycle through all agents by recent activity"
+description = "Cycle through idle, done, or unknown agents by recent activity"
 
 [[keys.command]]
 key = "alt+shift+quote"
 type = "plugin_action"
 command = "shadowfax.beacon.jump-recent-reverse"
-description = "Cycle backward through all agents by recent activity"
+description = "Cycle backward through idle, done, or unknown agents by recent activity"
 
 # Legacy terminals report Shift-apostrophe as a double quote.
 [[keys.command]]
 key = "alt+double_quote"
 type = "plugin_action"
 command = "shadowfax.beacon.jump-recent-reverse"
-description = "Cycle backward through all agents by recent activity"
+description = "Cycle backward through idle, done, or unknown agents by recent activity"
 ```
 
 It preserves unrelated configuration, is byte-for-byte idempotent, and refuses to replace any built-in or custom binding already using `Alt-u`, `Alt-o`, `Alt-'`, or `Shift-Alt-'`.
@@ -128,8 +128,8 @@ python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-working wo
 python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-unread workspace
 python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-unread workspace blocked
 python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-recent tab idle
-python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-recent workspace blocked
-BEACON_TEST_SHORTCUT=1 python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-recent-reverse workspace blocked
+python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-recent workspace idle
+BEACON_TEST_SHORTCUT=1 python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-recent-reverse workspace idle
 ```
 
 ## Remove

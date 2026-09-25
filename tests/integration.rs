@@ -17,6 +17,8 @@ if [ "$1 $2" = "agent get" ]; then
 elif [ "$1 $2" = "agent list" ]; then
   if [ "$FAKE_AGENT_LIST" = "working" ]; then
     printf '%s\n' '{"id":"fake","result":{"type":"agent_list","agents":[{"terminal_id":"terminal-1","agent_status":"working","workspace_id":"w1","pane_id":"w1:p1","focused":true,"state_change_seq":10},{"terminal_id":"terminal-2","agent_status":"working","workspace_id":"w1","pane_id":"w1:p2","focused":false,"state_change_seq":8}]}}'
+  elif [ "$FAKE_AGENT_LIST" = "settled" ]; then
+    printf '%s\n' '{"result":{"agents":[{"terminal_id":"terminal-1","agent_status":"idle","workspace_id":"w1","pane_id":"w1:p1","focused":true,"state_change_seq":10},{"terminal_id":"terminal-2","agent_status":"done","workspace_id":"w1","pane_id":"w1:p2","focused":false,"state_change_seq":8}]}}'
   elif [ "$FAKE_AGENT_LIST" = "unread" ]; then
     printf '%s\n' '{"result":{"agents":[{"terminal_id":"terminal-2","agent_status":"done","workspace_id":"w1","pane_id":"w1:p2","focused":false,"state_change_seq":8}]}}'
   else
@@ -175,7 +177,7 @@ fn recent_jump_uses_action_context_and_does_not_require_queue_state() {
             r#"{"focused_pane_id":"w1:p2"}"#,
         )
         .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
-        .env("FAKE_AGENT_LIST", "working")
+        .env("FAKE_AGENT_LIST", "settled")
         .env("FAKE_HERDR_LOG", &log)
         .output()
         .unwrap();
