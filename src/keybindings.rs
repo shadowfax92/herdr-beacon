@@ -123,7 +123,9 @@ pub fn install(path: &Path) -> Result<InstallOutcome> {
     let commands = commands_mut(&mut document)?;
     for binding in &BINDINGS {
         if commands.iter().any(|table| {
-            table_string(table, "key").is_some_and(|key| key_matches(key, binding.key))
+            table
+                .get("key")
+                .is_some_and(|item| item_uses_key(item, binding.key))
                 && table_string(table, "command") != Some(binding.command)
         }) {
             bail!("{} is already bound to another custom command", binding.key);
@@ -217,22 +219,25 @@ fn ensure_builtin_keys_are_available(document: &DocumentMut) -> Result<()> {
     };
     for binding in &BINDINGS {
         for (name, item) in keys.iter().filter(|(name, _)| *name != "command") {
-            let occupied = item
-                .as_str()
-                .is_some_and(|key| key_matches(key, binding.key))
-                || item.as_array().is_some_and(|array| {
-                    array.iter().any(|value| {
-                        value
-                            .as_str()
-                            .is_some_and(|key| key_matches(key, binding.key))
-                    })
-                });
+            let occupied = item_uses_key(item, binding.key);
             if occupied {
                 bail!("{} is already assigned to keys.{name}", binding.key);
             }
         }
     }
     Ok(())
+}
+
+/// Both built-in and custom Herdr bindings accept a string or an array of
+/// strings. Inspect every alias before touching the config so an array cannot
+/// silently keep a conflicting shortcut and disable Beacon's new binding.
+fn item_uses_key(item: &Item, expected: &str) -> bool {
+    item.as_str().is_some_and(|key| key_matches(key, expected))
+        || item.as_array().is_some_and(|array| {
+            array
+                .iter()
+                .any(|value| value.as_str().is_some_and(|key| key_matches(key, expected)))
+        })
 }
 
 /// The Alt-chord subset Beacon owns, normalized across Herdr modifier aliases
@@ -534,6 +539,24 @@ description = "Keep me"
                 assert!(install(&path).is_err(), "must detect {key}");
                 assert_eq!(fs::read_to_string(path).unwrap(), original);
             }
+        }
+    }
+
+    #[test]
+    fn install_refuses_custom_key_arrays_without_writing_or_backing_up() {
+        for key in [
+            "shift+alt+quote",
+            "option+double_quote",
+            "META+SHIFT+'",
+            "alt+u",
+            "alt+o",
+        ] {
+            let original = format!("[keys]\n[[keys.command]]\nkey = [\"alt+z\", \"{key}\"]\ntype = \"plugin_action\"\ncommand = \"someone.else.open\"\n");
+            let (directory, path) = write_config(&original);
+            let error = install(&path).unwrap_err();
+            assert!(error.to_string().contains("already bound"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
         }
     }
 
