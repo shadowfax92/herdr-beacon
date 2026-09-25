@@ -24,6 +24,7 @@ enum Commands {
     JumpUnread,
     JumpWorking,
     JumpRecent,
+    JumpRecentReverse,
     InstallKeybindings,
 }
 
@@ -32,6 +33,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Event => event::handle_event_from_environment(),
         Commands::JumpUnread => jump::jump_from_environment().map(|_| ()),
+        Commands::JumpRecentReverse => jump::jump_recent_reverse_from_environment().map(|_| ()),
         Commands::JumpRecent => jump::jump_recent_from_environment().map(|_| ()),
         Commands::JumpWorking => jump::jump_working_from_environment().map(|_| ()),
         Commands::InstallKeybindings => keybindings::install_from_environment().map(|_| ()),

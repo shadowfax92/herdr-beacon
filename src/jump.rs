@@ -13,6 +13,14 @@ pub enum JumpOutcome {
     Empty,
 }
 
+/// Direction within the same newest-first ring, not a second sort order. Keeping
+/// ties in one order makes forward then backward return to the same live agent.
+#[derive(Clone, Copy)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
 pub fn jump_from_environment() -> Result<JumpOutcome> {
     let store = StateStore::from_environment()?;
     let pane = invocation_pane();
@@ -27,6 +35,11 @@ pub fn jump_working_from_environment() -> Result<JumpOutcome> {
 pub fn jump_recent_from_environment() -> Result<JumpOutcome> {
     let pane = invocation_pane();
     jump_recent(&Herdr::from_environment(), pane.as_deref())
+}
+
+pub fn jump_recent_reverse_from_environment() -> Result<JumpOutcome> {
+    let pane = invocation_pane();
+    jump_recent_reverse(&Herdr::from_environment(), pane.as_deref())
 }
 
 /// Only action entrypoints read this context. A hook's identically named pane
@@ -62,14 +75,41 @@ pub fn jump_working(herdr: &impl HerdrClient, current_pane: Option<&str>) -> Res
         .into_iter()
         .filter(|agent| agent.status == AgentStatus::Working)
         .collect();
-    jump_in_activity_order(herdr, working, current_pane, "No working agents")
+    jump_in_activity_order(
+        herdr,
+        working,
+        current_pane,
+        "No working agents",
+        Direction::Forward,
+    )
 }
 
 /// Visits every live agent, regardless of status, newest activity first. Reading
 /// the live sequence avoids a second persistent history and does not rank the
 /// navigation itself as activity. Normal focus hooks still acknowledge unread work.
 pub fn jump_recent(herdr: &impl HerdrClient, current_pane: Option<&str>) -> Result<JumpOutcome> {
-    jump_in_activity_order(herdr, herdr.agent_list()?, current_pane, "No agents")
+    jump_in_activity_order(
+        herdr,
+        herdr.agent_list()?,
+        current_pane,
+        "No agents",
+        Direction::Forward,
+    )
+}
+
+/// Walks back toward newer activity in the same ring as `jump_recent`. From
+/// outside the live agent set, reverse navigation enters at the oldest agent.
+pub fn jump_recent_reverse(
+    herdr: &impl HerdrClient,
+    current_pane: Option<&str>,
+) -> Result<JumpOutcome> {
+    jump_in_activity_order(
+        herdr,
+        herdr.agent_list()?,
+        current_pane,
+        "No agents",
+        Direction::Backward,
+    )
 }
 
 fn jump_in_activity_order(
@@ -77,13 +117,16 @@ fn jump_in_activity_order(
     mut agents: Vec<AgentObservation>,
     current_pane: Option<&str>,
     empty_message: &str,
+    direction: Direction,
 ) -> Result<JumpOutcome> {
     sort_by_activity(&mut agents);
     if agents.is_empty() {
         herdr.notify(empty_message, None)?;
         return Ok(JumpOutcome::Empty);
     }
-    let pane_id = agents[next_index(&agents, current_pane)].pane_id.clone();
+    let pane_id = agents[cycle_index(&agents, current_pane, direction)]
+        .pane_id
+        .clone();
     herdr.focus_agent(&pane_id)?;
     Ok(JumpOutcome::Focused(pane_id))
 }
@@ -99,12 +142,20 @@ fn sort_by_activity(agents: &mut [AgentObservation]) {
     });
 }
 
-fn next_index(agents: &[AgentObservation], current_pane: Option<&str>) -> usize {
-    agents
+fn cycle_index(
+    agents: &[AgentObservation],
+    current_pane: Option<&str>,
+    direction: Direction,
+) -> usize {
+    let current = agents
         .iter()
-        .position(|agent| is_current(agent, current_pane))
-        .map(|index| (index + 1) % agents.len())
-        .unwrap_or(0)
+        .position(|agent| is_current(agent, current_pane));
+    match (direction, current) {
+        (Direction::Forward, Some(index)) => (index + 1) % agents.len(),
+        (Direction::Forward, None) => 0,
+        (Direction::Backward, Some(0) | None) => agents.len() - 1,
+        (Direction::Backward, Some(index)) => index - 1,
+    }
 }
 
 /// Unread completions are consumed once; blocked requests remain navigable until
@@ -154,7 +205,7 @@ pub fn jump_unread(
         if candidates.is_empty() {
             return Ok(None);
         }
-        let selected = &candidates[next_index(&candidates, current_pane)];
+        let selected = &candidates[cycle_index(&candidates, current_pane, Direction::Forward)];
         // A single blocker already on screen is not another destination.
         Ok((!is_current(selected, current_pane)).then(|| selected.clone()))
     })?;
@@ -344,6 +395,66 @@ mod tests {
             );
             current = expected.to_string();
         }
+    }
+
+    #[test]
+    fn reverse_recent_jump_inverts_forward_at_every_position_including_ties_and_wrap() {
+        let fake = FakeHerdr::new(vec![
+            agent("w3:p1", AgentStatus::Done, 10),
+            agent("w1:p1", AgentStatus::Idle, 8),
+            agent("w2:p1", AgentStatus::Blocked, 10),
+            agent("w5:p1", AgentStatus::Working, 14),
+            agent("w4:p1", AgentStatus::Unknown, 6),
+        ]);
+        for current in &fake.agents {
+            let JumpOutcome::Focused(next) = jump_recent(&fake, Some(&current.pane_id)).unwrap()
+            else {
+                panic!("expected a forward destination");
+            };
+            assert_eq!(
+                jump_recent_reverse(&fake, Some(&next)).unwrap(),
+                JumpOutcome::Focused(current.pane_id.clone())
+            );
+        }
+        let mut current = "outside".to_string();
+        for expected in ["w4:p1", "w1:p1", "w3:p1", "w2:p1", "w5:p1", "w4:p1"] {
+            assert_eq!(
+                jump_recent_reverse(&fake, Some(&current)).unwrap(),
+                JumpOutcome::Focused(expected.to_string())
+            );
+            current = expected.to_string();
+        }
+    }
+
+    #[test]
+    fn reverse_recent_jump_respects_invoking_pane_and_handles_empty_single_and_errors() {
+        let mut server_focused = agent("w1:p1", AgentStatus::Working, 12);
+        server_focused.focused = true;
+        let fake = FakeHerdr::new(vec![
+            server_focused.clone(),
+            agent("w2:p1", AgentStatus::Idle, 8),
+        ]);
+        assert_eq!(
+            jump_recent_reverse(&fake, Some("w2:p1")).unwrap(),
+            JumpOutcome::Focused("w1:p1".into())
+        );
+        assert_eq!(
+            jump_recent_reverse(&fake, None).unwrap(),
+            JumpOutcome::Focused("w2:p1".into())
+        );
+        let fake = FakeHerdr::new(vec![]);
+        assert_eq!(
+            jump_recent_reverse(&fake, None).unwrap(),
+            JumpOutcome::Empty
+        );
+        assert_eq!(*fake.notifications.lock().unwrap(), ["No agents"]);
+        let mut fake = FakeHerdr::new(vec![server_focused]);
+        assert_eq!(
+            jump_recent_reverse(&fake, Some("w1:p1")).unwrap(),
+            JumpOutcome::Focused("w1:p1".into())
+        );
+        fake.focus_error = true;
+        assert!(jump_recent_reverse(&fake, None).is_err());
     }
 
     #[test]
