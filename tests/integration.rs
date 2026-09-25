@@ -200,6 +200,7 @@ fn failed_tab_navigation_is_reported_by_all_shortcuts() {
         ("jump-working", "working"),
         ("jump-unread", "unread"),
         ("jump-recent", "unread"),
+        ("jump-recent-reverse", "unread"),
     ] {
         let temporary = tempdir().unwrap();
         let log = temporary.path().join("commands.log");
@@ -242,7 +243,12 @@ fn failed_tab_navigation_is_reported_by_all_shortcuts() {
 
 #[test]
 fn suppressed_empty_queue_notifications_are_successful_no_ops() {
-    for action in ["jump-unread", "jump-working", "jump-recent"] {
+    for action in [
+        "jump-unread",
+        "jump-working",
+        "jump-recent",
+        "jump-recent-reverse",
+    ] {
         for reason in ["rate_limited", "disabled", "busy", "no_foreground_client"] {
             let temporary = tempdir().unwrap();
             let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))

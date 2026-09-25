@@ -15,6 +15,7 @@ fn cli_exposes_only_the_supported_commands() {
     assert!(stdout.contains("jump-unread"));
     assert!(stdout.contains("jump-working"));
     assert!(stdout.contains("jump-recent"));
+    assert!(stdout.contains("jump-recent-reverse"));
     assert!(stdout.contains("install-keybindings"));
 }
 
@@ -44,6 +45,7 @@ fn manifest_declares_actions_hooks_and_locked_build() {
             "jump-unread",
             "jump-working",
             "jump-recent",
+            "jump-recent-reverse",
             "install-keybindings"
         ]
     );

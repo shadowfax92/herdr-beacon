@@ -27,9 +27,15 @@ description = "Cycle through all agents by most recent activity, regardless of s
 command = ["./target/release/herdr-beacon", "jump-recent"]
 
 [[actions]]
+id = "jump-recent-reverse"
+title = "Previous agent by recent activity"
+description = "Step backward through all agents in activity order."
+command = ["./target/release/herdr-beacon", "jump-recent-reverse"]
+
+[[actions]]
 id = "install-keybindings"
 title = "Install Beacon keybindings"
-description = "Bind Alt-U for unread/blocked, Alt-O for working, and Alt-' for all agents by activity."
+description = "Bind Alt-U for unread/blocked, Alt-O for working, and Alt-' / Shift-Alt-' for activity navigation."
 command = ["./target/release/herdr-beacon", "install-keybindings"]
 
 [[events]]

@@ -19,6 +19,10 @@ const WORKING_DESCRIPTION: &str = "Cycle through working agents";
 const RECENT_KEY: &str = "alt+quote";
 const RECENT_COMMAND: &str = "shadowfax.beacon.jump-recent";
 const RECENT_DESCRIPTION: &str = "Cycle through all agents by recent activity";
+const REVERSE_KEY: &str = "alt+shift+quote";
+const REVERSE_LEGACY_KEY: &str = "alt+double_quote";
+const REVERSE_COMMAND: &str = "shadowfax.beacon.jump-recent-reverse";
+const REVERSE_DESCRIPTION: &str = "Cycle backward through all agents by recent activity";
 
 /// One direct Herdr shortcut owned and normalized by Beacon's installer.
 struct Binding {
@@ -29,7 +33,7 @@ struct Binding {
 
 // This is the complete Beacon-owned set. Installation validates every destination
 // before rewriting any entry so a conflict cannot leave a partially upgraded config.
-const BINDINGS: [Binding; 3] = [
+const BINDINGS: [Binding; 5] = [
     Binding {
         key: UNREAD_KEY,
         command: UNREAD_COMMAND,
@@ -44,6 +48,18 @@ const BINDINGS: [Binding; 3] = [
         key: RECENT_KEY,
         command: RECENT_COMMAND,
         description: RECENT_DESCRIPTION,
+    },
+    Binding {
+        key: REVERSE_KEY,
+        command: REVERSE_COMMAND,
+        description: REVERSE_DESCRIPTION,
+    },
+    // Legacy terminals send Alt-double-quote without a separate Shift modifier.
+    // Both encodings invoke one action; neither is a second navigation step.
+    Binding {
+        key: REVERSE_LEGACY_KEY,
+        command: REVERSE_COMMAND,
+        description: REVERSE_DESCRIPTION,
     },
 ];
 
@@ -60,7 +76,10 @@ pub fn install_from_environment() -> Result<InstallOutcome> {
     match &outcome {
         InstallOutcome::Updated { .. } => {
             herdr.reload_config()?;
-            if let Err(error) = herdr.notify("Beacon is bound to Alt-U, Alt-O, and Alt-'", None) {
+            if let Err(error) = herdr.notify(
+                "Beacon shortcuts installed, including Shift-Alt-' to go back",
+                None,
+            ) {
                 eprintln!("Beacon keybinding installed; confirmation not shown: {error}");
             }
         }
@@ -111,13 +130,25 @@ pub fn install(path: &Path) -> Result<InstallOutcome> {
         }
     }
 
-    let all_bindings_are_current = BINDINGS.iter().all(|binding| {
-        let matching = commands
-            .iter()
-            .filter(|table| table_string(table, "command") == Some(binding.command))
-            .collect::<Vec<_>>();
-        matching.len() == 1 && is_desired(matching[0], binding)
-    });
+    // One action can own multiple terminal encodings. Require each exact block
+    // once and no extra owned blocks, so upgrades remove stale bindings and a
+    // second install remains byte-for-byte unchanged.
+    let owned_count = commands
+        .iter()
+        .filter(|table| {
+            BINDINGS
+                .iter()
+                .any(|binding| table_string(table, "command") == Some(binding.command))
+        })
+        .count();
+    let all_bindings_are_current = owned_count == BINDINGS.len()
+        && BINDINGS.iter().all(|binding| {
+            commands
+                .iter()
+                .filter(|table| is_desired(table, binding))
+                .count()
+                == 1
+        });
     if all_bindings_are_current {
         return Ok(InstallOutcome::Unchanged);
     }
@@ -204,31 +235,58 @@ fn ensure_builtin_keys_are_available(document: &DocumentMut) -> Result<()> {
     Ok(())
 }
 
-/// Match only Beacon's unshifted Alt shortcuts using Herdr's modifier aliases,
-/// arbitrary token order, and literal/named quote spellings. Single uppercase
-/// letters imply Shift in Herdr, so lowercasing the whole binding is incorrect.
-fn key_matches(actual: &str, expected: &str) -> bool {
-    let wanted = expected
-        .strip_prefix("alt+")
-        .expect("Beacon owns Alt shortcuts");
-    let mut has_alt = false;
-    let mut has_key = false;
-    for token in actual.split('+').map(str::trim) {
-        if ["alt", "option", "meta"]
-            .iter()
-            .any(|alias| token.eq_ignore_ascii_case(alias))
-        {
-            has_alt = true;
-        } else if !has_key
-            && (token == wanted
-                || (wanted == "quote" && (token == "'" || token.eq_ignore_ascii_case("quote"))))
-        {
-            has_key = true;
-        } else {
-            return false;
+/// The Alt-chord subset Beacon owns, normalized across Herdr modifier aliases
+/// and shifted punctuation. This protects config writes from shadowing equivalent
+/// user bindings; it is not a replacement for Herdr's general key parser.
+#[derive(PartialEq, Eq)]
+struct AltShortcut {
+    key: char,
+    shift: bool,
+}
+
+impl AltShortcut {
+    fn parse(value: &str) -> Option<Self> {
+        let mut has_alt = false;
+        let mut shift = false;
+        let mut key = None;
+        for token in value.split('+').map(str::trim) {
+            match token.to_ascii_lowercase().as_str() {
+                "alt" | "option" | "meta" => has_alt = true,
+                "shift" => shift = true,
+                _ if key.is_some() => return None,
+                "quote" => key = Some('\''),
+                "double_quote" | "double-quote" => key = Some('"'),
+                _ => {
+                    let mut chars = token.chars();
+                    key = Some(chars.next()?);
+                    if chars.next().is_some() {
+                        return None;
+                    }
+                }
+            }
         }
+        if !has_alt {
+            return None;
+        }
+        let mut key = key?;
+        // Uppercase letters mean Shift in Herdr; punctuation may instead arrive
+        // as its shifted character, with or without an explicit Shift bit.
+        if key.is_ascii_uppercase() {
+            key = key.to_ascii_lowercase();
+            shift = true;
+        }
+        if key == '\'' && shift {
+            key = '"';
+        }
+        if key == '"' {
+            shift = false;
+        }
+        Some(Self { key, shift })
     }
-    has_alt && has_key
+}
+
+fn key_matches(actual: &str, expected: &str) -> bool {
+    AltShortcut::parse(actual).is_some_and(|key| Some(key) == AltShortcut::parse(expected))
 }
 
 fn is_desired(table: &Table, binding: &Binding) -> bool {
@@ -363,6 +421,8 @@ description = "Scratch"
                 (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
                 (WORKING_KEY.into(), WORKING_COMMAND.into()),
                 (RECENT_KEY.into(), RECENT_COMMAND.into()),
+                (REVERSE_KEY.into(), REVERSE_COMMAND.into()),
+                (REVERSE_LEGACY_KEY.into(), REVERSE_COMMAND.into()),
             ]
         );
     }
@@ -408,6 +468,8 @@ description = "Duplicate"
                 (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
                 (WORKING_KEY.into(), WORKING_COMMAND.into()),
                 (RECENT_KEY.into(), RECENT_COMMAND.into()),
+                (REVERSE_KEY.into(), REVERSE_COMMAND.into()),
+                (REVERSE_LEGACY_KEY.into(), REVERSE_COMMAND.into()),
             ]
         );
     }
@@ -458,6 +520,11 @@ description = "Keep me"
             "ALT+META+QUOTE",
             "u+option",
             "META+o",
+            "shift+option+quote",
+            "SHIFT + ' + META",
+            "meta+double_quote",
+            "double-quote+alt",
+            "alt+shift+double_quote",
         ] {
             for original in [
                 format!("[keys]\nnext_agent = [\"{key}\"]\n"),
@@ -472,7 +539,7 @@ description = "Keep me"
 
     #[test]
     fn install_allows_distinct_shifted_or_modified_shortcuts() {
-        for key in ["alt+U", "alt+O", "alt+shift+quote", "ctrl+alt+quote"] {
+        for key in ["alt+U", "alt+O", "ctrl+alt+quote", "ctrl+alt+shift+quote"] {
             let original = format!("[keys]\nnext_agent = \"{key}\"\n");
             let (_directory, path) = write_config(&original);
             assert!(install(&path).is_ok(), "must preserve distinct {key}");
@@ -505,6 +572,8 @@ description = "Keep me"
                 (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
                 (WORKING_KEY.into(), WORKING_COMMAND.into()),
                 (RECENT_KEY.into(), RECENT_COMMAND.into()),
+                (REVERSE_KEY.into(), REVERSE_COMMAND.into()),
+                (REVERSE_LEGACY_KEY.into(), REVERSE_COMMAND.into()),
             ]
         );
     }

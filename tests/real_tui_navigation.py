@@ -1,9 +1,11 @@
 """Opt-in regression: verify Beacon's jump changes a real Herdr TUI's contents.
 
-Usage: python3 tests/real_tui_navigation.py BEACON_BIN jump-working|jump-unread|jump-recent tab|workspace [working|idle|blocked|done|unknown]
+Usage: python3 tests/real_tui_navigation.py BEACON_BIN jump-working|jump-unread|jump-recent|jump-recent-reverse tab|workspace [working|idle|blocked|done|unknown]
 Requires an installed Herdr. Each run owns an isolated PTY, server, and temporary
 config/state roots; it never connects to the user's live session.
 Set BEACON_TEST_SHORTCUT=1 to install the plugin and send its actual shortcut.
+Reverse navigation also verifies that a subsequent forward jump restores origin.
+BEACON_TEST_KEY_ENCODING selects legacy (default), csi-u, or kitty reverse input.
 """
 import fcntl
 import json
@@ -22,7 +24,7 @@ import time
 
 beacon = str(Path(sys.argv[1]).resolve())
 action, destination = sys.argv[2:4]
-assert action in ("jump-working", "jump-unread", "jump-recent")
+assert action in ("jump-working", "jump-unread", "jump-recent", "jump-recent-reverse")
 status = sys.argv[4] if len(sys.argv) > 4 else None
 assert destination in ("tab", "workspace")
 herdr = shutil.which("herdr")
@@ -87,6 +89,7 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
         if shortcut:
             cli("plugin", "link", str(Path(beacon).parents[2]))
             invoke("install-keybindings")
+            cli("config", "check")
 
         cli("pane", "run", pane, "printf 'BEACON_CROSS_TAB_VISIBLE\\n'")
         cli("pane", "report-agent", pane, "--agent", "codex", "--state", "working", "--source", "beacon:repro")
@@ -100,14 +103,33 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
             cli("pane", "report-agent", pane, "--agent", "codex", "--state", "idle", "--source", "beacon:repro")
         if status:
             cli("pane", "report-agent", pane, "--agent", "codex", "--state", status, "--source", "beacon:repro")
+        if action == "jump-recent-reverse":
+            # Three agents distinguish reverse from forward: origin (newest),
+            # middle, target (oldest). Reverse must wrap origin -> target.
+            middle = cli("tab", "create", "--label", "middle", "--no-focus")["result"]["root_pane"]["pane_id"]
+            cli("pane", "report-agent", middle, "--agent", "codex", "--state", "working", "--source", "beacon:repro")
+            cli("pane", "run", origin, "printf 'BEACON_ORIGIN_VISIBLE\\n'")
+            cli("pane", "report-agent", origin, "--agent", "codex", "--state", "working", "--source", "beacon:repro")
         assert "BEACON_CROSS_TAB_VISIBLE" not in frame(), "target was visible before navigation"
         if shortcut:
-            os.write(fd, {"jump-unread": b"\x1bu", "jump-working": b"\x1bo", "jump-recent": b"\x1b'"}[action])
+            encoding = os.environ.get("BEACON_TEST_KEY_ENCODING", "legacy")
+            reverse_key = {"legacy": b'\x1b"', "csi-u": b"\x1b[39;4u", "kitty": b"\x1b[39:34;4u"}[encoding]
+            os.write(fd, {"jump-unread": b"\x1bu", "jump-working": b"\x1bo", "jump-recent": b"\x1b'",
+                          "jump-recent-reverse": reverse_key}[action])
         else:
             invoke(action)
         visible = "BEACON_CROSS_TAB_VISIBLE" in frame(2 if shortcut else 0.8)
         print(json.dumps({"action": action, "destination": destination, "status": status, "shortcut": shortcut, "target_visible": visible}))
         assert visible, "Beacon succeeded but attached TUI did not display the target tab"
+        if action == "jump-recent-reverse":
+            if shortcut:
+                os.write(fd, b"\x1b'")
+            else:
+                plugin_env["HERDR_PLUGIN_CONTEXT_JSON"] = json.dumps({"focused_pane_id": pane})
+                invoke("jump-recent")
+            restored = "BEACON_ORIGIN_VISIBLE" in frame(2 if shortcut else 0.8)
+            print(json.dumps({"roundtrip_restored_origin": restored}))
+            assert restored, "Forward must undo reverse when activity order is unchanged"
     finally:
         # Never stop the user's server: this environment selects only our named
         # test session. Close the owned PTY even if server shutdown fails.
