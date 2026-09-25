@@ -2,7 +2,7 @@ id = "shadowfax.beacon"
 name = "Beacon"
 version = "0.1.0"
 min_herdr_version = "0.7.5"
-description = "Jump to unread agents or cycle through active turns in Herdr."
+description = "Navigate unread or blocked agents, working turns, or all agents by recent activity."
 platforms = ["macos", "linux"]
 
 [[build]]
@@ -10,8 +10,8 @@ command = ["cargo", "build", "--release", "--locked"]
 
 [[actions]]
 id = "jump-unread"
-title = "Jump to unread agent"
-description = "Focus the newest unread agent."
+title = "Jump to unread or blocked agent"
+description = "Cycle through unread completions and blocked agents."
 command = ["./target/release/herdr-beacon", "jump-unread"]
 
 [[actions]]
@@ -21,9 +21,15 @@ description = "Cycle through agents with an active turn."
 command = ["./target/release/herdr-beacon", "jump-working"]
 
 [[actions]]
+id = "jump-recent"
+title = "Jump to recently active agent"
+description = "Cycle through all agents by most recent activity, regardless of status."
+command = ["./target/release/herdr-beacon", "jump-recent"]
+
+[[actions]]
 id = "install-keybindings"
 title = "Install Beacon keybindings"
-description = "Bind Alt-U for unread agents and Alt-O for working agents."
+description = "Bind Alt-U for unread/blocked, Alt-O for working, and Alt-' for all agents by activity."
 command = ["./target/release/herdr-beacon", "install-keybindings"]
 
 [[events]]

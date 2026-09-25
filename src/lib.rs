@@ -11,7 +11,7 @@ pub mod state;
 #[derive(Debug, Parser)]
 #[command(
     name = "herdr-beacon",
-    about = "Attention and working-agent navigation for Herdr"
+    about = "Attention and activity-ordered agent navigation for Herdr"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,6 +23,7 @@ enum Commands {
     Event,
     JumpUnread,
     JumpWorking,
+    JumpRecent,
     InstallKeybindings,
 }
 
@@ -31,6 +32,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Event => event::handle_event_from_environment(),
         Commands::JumpUnread => jump::jump_from_environment().map(|_| ()),
+        Commands::JumpRecent => jump::jump_recent_from_environment().map(|_| ()),
         Commands::JumpWorking => jump::jump_working_from_environment().map(|_| ()),
         Commands::InstallKeybindings => keybindings::install_from_environment().map(|_| ()),
     }

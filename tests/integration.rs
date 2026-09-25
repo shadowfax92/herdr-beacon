@@ -104,7 +104,7 @@ fn empty_jump_requests_an_explicitly_soundless_notification() {
     );
     assert_eq!(
         fs::read_to_string(log).unwrap(),
-        "agent list\nnotification show No unread agents --sound none\n"
+        "agent list\nnotification show No other unread or blocked agents --sound none\n"
     );
 }
 
@@ -162,8 +162,45 @@ fn working_jump_uses_action_context_before_server_focus_or_inherited_pane() {
 }
 
 #[test]
-fn failed_tab_navigation_is_reported_by_both_shortcuts() {
-    for (action, agents) in [("jump-working", "working"), ("jump-unread", "unread")] {
+fn recent_jump_uses_action_context_and_does_not_require_queue_state() {
+    let temporary = tempdir().unwrap();
+    let log = temporary.path().join("commands.log");
+    let state_dir = temporary.path().join("state");
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
+        .arg("jump-recent")
+        .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"focused_pane_id":"w1:p2"}"#,
+        )
+        .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
+        .env("FAKE_AGENT_LIST", "working")
+        .env("FAKE_HERDR_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        "agent list\nagent focus w1:p1\ntab focus w1:t9\n"
+    );
+    assert!(
+        !state_dir.exists(),
+        "Recent jumps do not need a second persisted activity history"
+    );
+}
+
+#[test]
+fn failed_tab_navigation_is_reported_by_all_shortcuts() {
+    for (action, agents) in [
+        ("jump-working", "working"),
+        ("jump-unread", "unread"),
+        ("jump-recent", "unread"),
+    ] {
         let temporary = tempdir().unwrap();
         let log = temporary.path().join("commands.log");
         let state_dir = temporary.path().join("state");
@@ -205,7 +242,7 @@ fn failed_tab_navigation_is_reported_by_both_shortcuts() {
 
 #[test]
 fn suppressed_empty_queue_notifications_are_successful_no_ops() {
-    for action in ["jump-unread", "jump-working"] {
+    for action in ["jump-unread", "jump-working", "jump-recent"] {
         for reason in ["rate_limited", "disabled", "busy", "no_foreground_client"] {
             let temporary = tempdir().unwrap();
             let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))

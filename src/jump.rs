@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::herdr::{Herdr, HerdrClient};
-use crate::model::{AgentStatus, ObservationSource, UnreadEntry};
+use crate::model::{AgentObservation, AgentStatus, ObservationSource};
 use crate::state::StateStore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +22,11 @@ pub fn jump_from_environment() -> Result<JumpOutcome> {
 pub fn jump_working_from_environment() -> Result<JumpOutcome> {
     let pane = invocation_pane();
     jump_working(&Herdr::from_environment(), pane.as_deref())
+}
+
+pub fn jump_recent_from_environment() -> Result<JumpOutcome> {
+    let pane = invocation_pane();
+    jump_recent(&Herdr::from_environment(), pane.as_deref())
 }
 
 /// Only action entrypoints read this context. A hook's identically named pane
@@ -52,33 +57,59 @@ fn is_current(agent: &crate::model::AgentObservation, current_pane: Option<&str>
 /// Herdr's status sequence supplies a cross-workspace recency order; the focused
 /// working pane is the cursor so repeated invocations visit every active turn.
 pub fn jump_working(herdr: &impl HerdrClient, current_pane: Option<&str>) -> Result<JumpOutcome> {
-    let mut working = herdr
+    let working = herdr
         .agent_list()?
         .into_iter()
         .filter(|agent| agent.status == AgentStatus::Working)
-        .collect::<Vec<_>>();
-    working.sort_by(|left, right| {
+        .collect();
+    jump_in_activity_order(herdr, working, current_pane, "No working agents")
+}
+
+/// Visits every live agent, regardless of status, newest activity first. Reading
+/// the live sequence avoids a second persistent history and does not rank the
+/// navigation itself as activity. Normal focus hooks still acknowledge unread work.
+pub fn jump_recent(herdr: &impl HerdrClient, current_pane: Option<&str>) -> Result<JumpOutcome> {
+    jump_in_activity_order(herdr, herdr.agent_list()?, current_pane, "No agents")
+}
+
+fn jump_in_activity_order(
+    herdr: &impl HerdrClient,
+    mut agents: Vec<AgentObservation>,
+    current_pane: Option<&str>,
+    empty_message: &str,
+) -> Result<JumpOutcome> {
+    sort_by_activity(&mut agents);
+    if agents.is_empty() {
+        herdr.notify(empty_message, None)?;
+        return Ok(JumpOutcome::Empty);
+    }
+    let pane_id = agents[next_index(&agents, current_pane)].pane_id.clone();
+    herdr.focus_agent(&pane_id)?;
+    Ok(JumpOutcome::Focused(pane_id))
+}
+
+/// Status sequences are supplied by one Herdr server across all workspaces.
+/// Pane IDs break ties deterministically, including older servers with no sequence.
+fn sort_by_activity(agents: &mut [AgentObservation]) {
+    agents.sort_by(|left, right| {
         right
             .state_change_seq
             .cmp(&left.state_change_seq)
             .then_with(|| left.pane_id.cmp(&right.pane_id))
     });
-
-    if working.is_empty() {
-        herdr.notify("No working agents", None)?;
-        return Ok(JumpOutcome::Empty);
-    }
-
-    let next = working
-        .iter()
-        .position(|agent| is_current(agent, current_pane))
-        .map(|index| (index + 1) % working.len())
-        .unwrap_or(0);
-    let pane_id = working[next].pane_id.clone();
-    herdr.focus_agent(&pane_id)?;
-    Ok(JumpOutcome::Focused(pane_id))
 }
 
+fn next_index(agents: &[AgentObservation], current_pane: Option<&str>) -> usize {
+    agents
+        .iter()
+        .position(|agent| is_current(agent, current_pane))
+        .map(|index| (index + 1) % agents.len())
+        .unwrap_or(0)
+}
+
+/// Unread completions are consumed once; blocked requests remain navigable until
+/// resolved. Keep these concepts separate so visiting a blocker cannot recreate
+/// an already acknowledged completion in the persisted unread ledger.
 pub fn jump_unread(
     herdr: &impl HerdrClient,
     store: &StateStore,
@@ -92,11 +123,11 @@ pub fn jump_unread(
             .iter()
             .map(|agent| agent.pane_id.clone())
             .collect::<BTreeSet<_>>();
-        for observation in agents {
-            let current = is_current(&observation, current_pane);
+        for observation in &agents {
+            let current = is_current(observation, current_pane);
             state.observe(observation.clone(), ObservationSource::Reconcile);
             if current {
-                state.observe(observation, ObservationSource::Focus);
+                state.observe(observation.clone(), ObservationSource::Focus);
             }
         }
         let missing = state
@@ -108,11 +139,23 @@ pub fn jump_unread(
         for pane_id in missing {
             state.remove_pane(&pane_id);
         }
-        Ok(state.newest().cloned())
+        let mut candidates = agents
+            .into_iter()
+            .filter(|agent| {
+                agent.status == AgentStatus::Blocked || state.entries().contains_key(&agent.pane_id)
+            })
+            .collect::<Vec<_>>();
+        sort_by_activity(&mut candidates);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let selected = &candidates[next_index(&candidates, current_pane)];
+        // A single blocker already on screen is not another destination.
+        Ok((!is_current(selected, current_pane)).then(|| selected.clone()))
     })?;
 
     let Some(selected) = selected else {
-        herdr.notify("No unread agents", None)?;
+        herdr.notify("No other unread or blocked agents", None)?;
         return Ok(JumpOutcome::Empty);
     };
 
@@ -124,7 +167,7 @@ pub fn jump_unread(
 fn mark_focus_seen(
     store: &StateStore,
     focused: crate::model::AgentObservation,
-    selected: &UnreadEntry,
+    selected: &AgentObservation,
 ) -> Result<()> {
     store.update(|state| {
         state.observe(focused, ObservationSource::Focus);
@@ -280,6 +323,58 @@ mod tests {
     }
 
     #[test]
+    fn recent_jump_visits_every_status_in_activity_order_and_wraps() {
+        let fake = FakeHerdr::new(vec![
+            agent("w1:p1", AgentStatus::Idle, 8),
+            agent("w2:p1", AgentStatus::Blocked, 12),
+            agent("w3:p1", AgentStatus::Done, 10),
+            agent("w4:p1", AgentStatus::Unknown, 6),
+            agent("w5:p1", AgentStatus::Working, 14),
+        ]);
+        let mut current = "outside".to_string();
+        for expected in ["w5:p1", "w2:p1", "w3:p1", "w1:p1", "w4:p1", "w5:p1"] {
+            assert_eq!(
+                jump_recent(&fake, Some(&current)).unwrap(),
+                JumpOutcome::Focused(expected.to_string())
+            );
+            current = expected.to_string();
+        }
+    }
+
+    #[test]
+    fn recent_jump_uses_invoking_pane_with_stable_ties() {
+        let mut server_focused = agent("w1:p1", AgentStatus::Working, 0);
+        server_focused.focused = true;
+        let fake = FakeHerdr::new(vec![
+            agent("w3:p1", AgentStatus::Idle, 0),
+            server_focused,
+            agent("w2:p1", AgentStatus::Blocked, 0),
+        ]);
+        assert_eq!(
+            jump_recent(&fake, Some("w2:p1")).unwrap(),
+            JumpOutcome::Focused("w3:p1".to_string())
+        );
+        assert_eq!(
+            jump_recent(&fake, None).unwrap(),
+            JumpOutcome::Focused("w2:p1".to_string())
+        );
+    }
+
+    #[test]
+    fn recent_jump_handles_no_agents_and_propagates_focus_failure() {
+        let fake = FakeHerdr::new(vec![]);
+        assert_eq!(jump_recent(&fake, None).unwrap(), JumpOutcome::Empty);
+        assert_eq!(*fake.notifications.lock().unwrap(), ["No agents"]);
+        let mut fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Unknown, 8)]);
+        assert_eq!(
+            jump_recent(&fake, Some("w1:p1")).unwrap(),
+            JumpOutcome::Focused("w1:p1".to_string())
+        );
+        fake.focus_error = true;
+        assert!(jump_recent(&fake, None).is_err());
+    }
+
+    #[test]
     fn unread_jump_keeps_api_idle_completion_and_does_not_repeat_it() {
         let (_temporary, store) = store();
         store
@@ -389,15 +484,63 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_does_not_invent_blocked_unread_state() {
+    fn unread_jump_includes_already_blocked_agents_without_inventing_unread_state() {
         let (_temporary, store) = store();
         let fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Blocked, 7)]);
 
         let outcome = jump_unread(&fake, &store, None).unwrap();
 
-        assert_eq!(outcome, JumpOutcome::Empty);
+        assert_eq!(outcome, JumpOutcome::Focused("w1:p1".to_string()));
         assert!(store.read().unwrap().entries().is_empty());
-        assert_eq!(*fake.notifications.lock().unwrap(), ["No unread agents"]);
+    }
+
+    #[test]
+    fn unread_jump_cycles_seen_blocked_agents_and_consumes_completions() {
+        let (_temporary, store) = store();
+        let fake = FakeHerdr::new(vec![
+            agent("w1:p1", AgentStatus::Blocked, 12),
+            agent("w2:p1", AgentStatus::Done, 10),
+            agent("w3:p1", AgentStatus::Blocked, 8),
+            agent("w4:p1", AgentStatus::Blocked, 4),
+            agent("w5:p1", AgentStatus::Idle, 20),
+        ]);
+        // Having looked at a blocked request does not resolve its need for input.
+        store
+            .update(|state| {
+                for observation in &fake.agents {
+                    if observation.status == AgentStatus::Blocked {
+                        state.observe(observation.clone(), ObservationSource::Focus);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut current = "w5:p1".to_string();
+        for expected in ["w1:p1", "w2:p1", "w1:p1", "w3:p1", "w4:p1", "w1:p1"] {
+            assert_eq!(
+                jump_unread(&fake, &store, Some(&current)).unwrap(),
+                JumpOutcome::Focused(expected.to_string())
+            );
+            current = expected.to_string();
+        }
+        assert!(store.read().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn unread_jump_drops_a_resolved_blocker() {
+        let (_temporary, store) = store();
+        let blocked = agent("w1:p1", AgentStatus::Blocked, 8);
+        store
+            .update(|state| {
+                state.observe(blocked, ObservationSource::Focus);
+                Ok(())
+            })
+            .unwrap();
+        let fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Working, 9)]);
+        assert_eq!(
+            jump_unread(&fake, &store, Some("w2:p1")).unwrap(),
+            JumpOutcome::Empty
+        );
     }
 
     #[test]

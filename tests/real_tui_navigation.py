@@ -1,8 +1,9 @@
 """Opt-in regression: verify Beacon's jump changes a real Herdr TUI's contents.
 
-Usage: python3 tests/real_tui_navigation.py BEACON_BIN jump-working|jump-unread tab|workspace
+Usage: python3 tests/real_tui_navigation.py BEACON_BIN jump-working|jump-unread|jump-recent tab|workspace [working|idle|blocked|done|unknown]
 Requires an installed Herdr. Each run owns an isolated PTY, server, and temporary
 config/state roots; it never connects to the user's live session.
+Set BEACON_TEST_SHORTCUT=1 to install the plugin and send its actual shortcut.
 """
 import fcntl
 import json
@@ -21,7 +22,8 @@ import time
 
 beacon = str(Path(sys.argv[1]).resolve())
 action, destination = sys.argv[2:4]
-assert action in ("jump-working", "jump-unread")
+assert action in ("jump-working", "jump-unread", "jump-recent")
+status = sys.argv[4] if len(sys.argv) > 4 else None
 assert destination in ("tab", "workspace")
 herdr = shutil.which("herdr")
 assert herdr, "Herdr must be installed"
@@ -29,8 +31,12 @@ session = f"beacon-repro-{os.getpid()}"
 
 with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
     env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+    # Herdr writes auxiliary files beside config.toml. Keep those files and any
+    # shortcut installation inside this run's directory, never beside the fixture.
+    config = Path(root) / "config.toml"
+    shutil.copyfile(Path(__file__).with_name("herdr-repro.toml"), config)
     env.update(XDG_CONFIG_HOME=root + "/config", XDG_STATE_HOME=root + "/state",
-               HERDR_CONFIG_PATH=str(Path(__file__).with_name("herdr-repro.toml").resolve()),
+               HERDR_CONFIG_PATH=str(config),
                TERM="xterm-256color")
 
     def cli(*args):
@@ -77,6 +83,11 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
                                     capture_output=True, text=True, timeout=8)
             assert result.returncode == 0, result.stderr or result.stdout
 
+        shortcut = os.environ.get("BEACON_TEST_SHORTCUT") == "1"
+        if shortcut:
+            cli("plugin", "link", str(Path(beacon).parents[2]))
+            invoke("install-keybindings")
+
         cli("pane", "run", pane, "printf 'BEACON_CROSS_TAB_VISIBLE\\n'")
         cli("pane", "report-agent", pane, "--agent", "codex", "--state", "working", "--source", "beacon:repro")
         if action == "jump-unread":
@@ -87,10 +98,15 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
                                   "data": {"type": "pane_agent_status_changed", "pane_id": pane}}))
             invoke("event")
             cli("pane", "report-agent", pane, "--agent", "codex", "--state", "idle", "--source", "beacon:repro")
+        if status:
+            cli("pane", "report-agent", pane, "--agent", "codex", "--state", status, "--source", "beacon:repro")
         assert "BEACON_CROSS_TAB_VISIBLE" not in frame(), "target was visible before navigation"
-        invoke(action)
-        visible = "BEACON_CROSS_TAB_VISIBLE" in frame()
-        print(json.dumps({"action": action, "destination": destination, "target_visible": visible}))
+        if shortcut:
+            os.write(fd, {"jump-unread": b"\x1bu", "jump-working": b"\x1bo", "jump-recent": b"\x1b'"}[action])
+        else:
+            invoke(action)
+        visible = "BEACON_CROSS_TAB_VISIBLE" in frame(2 if shortcut else 0.8)
+        print(json.dumps({"action": action, "destination": destination, "status": status, "shortcut": shortcut, "target_visible": visible}))
         assert visible, "Beacon succeeded but attached TUI did not display the target tab"
     finally:
         # Never stop the user's server: this environment selects only our named

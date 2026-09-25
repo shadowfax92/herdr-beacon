@@ -12,10 +12,13 @@ use crate::herdr::{Herdr, HerdrClient};
 
 const UNREAD_KEY: &str = "alt+u";
 const UNREAD_COMMAND: &str = "shadowfax.beacon.jump-unread";
-const UNREAD_DESCRIPTION: &str = "Jump to newest unread agent";
+const UNREAD_DESCRIPTION: &str = "Cycle through unread or blocked agents";
 const WORKING_KEY: &str = "alt+o";
 const WORKING_COMMAND: &str = "shadowfax.beacon.jump-working";
 const WORKING_DESCRIPTION: &str = "Cycle through working agents";
+const RECENT_KEY: &str = "alt+quote";
+const RECENT_COMMAND: &str = "shadowfax.beacon.jump-recent";
+const RECENT_DESCRIPTION: &str = "Cycle through all agents by recent activity";
 
 /// One direct Herdr shortcut owned and normalized by Beacon's installer.
 struct Binding {
@@ -25,8 +28,8 @@ struct Binding {
 }
 
 // This is the complete Beacon-owned set. Installation validates every destination
-// before rewriting either entry so a conflict cannot leave a partially upgraded config.
-const BINDINGS: [Binding; 2] = [
+// before rewriting any entry so a conflict cannot leave a partially upgraded config.
+const BINDINGS: [Binding; 3] = [
     Binding {
         key: UNREAD_KEY,
         command: UNREAD_COMMAND,
@@ -36,6 +39,11 @@ const BINDINGS: [Binding; 2] = [
         key: WORKING_KEY,
         command: WORKING_COMMAND,
         description: WORKING_DESCRIPTION,
+    },
+    Binding {
+        key: RECENT_KEY,
+        command: RECENT_COMMAND,
+        description: RECENT_DESCRIPTION,
     },
 ];
 
@@ -52,7 +60,7 @@ pub fn install_from_environment() -> Result<InstallOutcome> {
     match &outcome {
         InstallOutcome::Updated { .. } => {
             herdr.reload_config()?;
-            if let Err(error) = herdr.notify("Beacon is bound to Alt-U and Alt-O", None) {
+            if let Err(error) = herdr.notify("Beacon is bound to Alt-U, Alt-O, and Alt-'", None) {
                 eprintln!("Beacon keybinding installed; confirmation not shown: {error}");
             }
         }
@@ -96,7 +104,7 @@ pub fn install(path: &Path) -> Result<InstallOutcome> {
     let commands = commands_mut(&mut document)?;
     for binding in &BINDINGS {
         if commands.iter().any(|table| {
-            table_string(table, "key") == Some(binding.key)
+            table_string(table, "key").is_some_and(|key| key_matches(key, binding.key))
                 && table_string(table, "command") != Some(binding.command)
         }) {
             bail!("{} is already bound to another custom command", binding.key);
@@ -178,11 +186,15 @@ fn ensure_builtin_keys_are_available(document: &DocumentMut) -> Result<()> {
     };
     for binding in &BINDINGS {
         for (name, item) in keys.iter().filter(|(name, _)| *name != "command") {
-            let occupied = item.as_str() == Some(binding.key)
+            let occupied = item
+                .as_str()
+                .is_some_and(|key| key_matches(key, binding.key))
                 || item.as_array().is_some_and(|array| {
-                    array
-                        .iter()
-                        .any(|value| value.as_str() == Some(binding.key))
+                    array.iter().any(|value| {
+                        value
+                            .as_str()
+                            .is_some_and(|key| key_matches(key, binding.key))
+                    })
                 });
             if occupied {
                 bail!("{} is already assigned to keys.{name}", binding.key);
@@ -190,6 +202,33 @@ fn ensure_builtin_keys_are_available(document: &DocumentMut) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Match only Beacon's unshifted Alt shortcuts using Herdr's modifier aliases,
+/// arbitrary token order, and literal/named quote spellings. Single uppercase
+/// letters imply Shift in Herdr, so lowercasing the whole binding is incorrect.
+fn key_matches(actual: &str, expected: &str) -> bool {
+    let wanted = expected
+        .strip_prefix("alt+")
+        .expect("Beacon owns Alt shortcuts");
+    let mut has_alt = false;
+    let mut has_key = false;
+    for token in actual.split('+').map(str::trim) {
+        if ["alt", "option", "meta"]
+            .iter()
+            .any(|alias| token.eq_ignore_ascii_case(alias))
+        {
+            has_alt = true;
+        } else if !has_key
+            && (token == wanted
+                || (wanted == "quote" && (token == "'" || token.eq_ignore_ascii_case("quote"))))
+        {
+            has_key = true;
+        } else {
+            return false;
+        }
+    }
+    has_alt && has_key
 }
 
 fn is_desired(table: &Table, binding: &Binding) -> bool {
@@ -322,7 +361,8 @@ description = "Scratch"
             vec![
                 ("alt+i".into(), "shadowfax.scratch.toggle-nvim".into()),
                 (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
-                ("alt+o".into(), "shadowfax.beacon.jump-working".into(),),
+                (WORKING_KEY.into(), WORKING_COMMAND.into()),
+                (RECENT_KEY.into(), RECENT_COMMAND.into()),
             ]
         );
     }
@@ -367,6 +407,7 @@ description = "Duplicate"
             vec![
                 (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
                 (WORKING_KEY.into(), WORKING_COMMAND.into()),
+                (RECENT_KEY.into(), RECENT_COMMAND.into()),
             ]
         );
     }
@@ -406,6 +447,39 @@ description = "Keep me"
     }
 
     #[test]
+    fn install_refuses_equivalent_alt_shortcuts_before_writing() {
+        for key in [
+            "alt+quote",
+            "alt+'",
+            "option+quote",
+            "meta+'",
+            "quote+alt",
+            " ' + OPTION ",
+            "ALT+META+QUOTE",
+            "u+option",
+            "META+o",
+        ] {
+            for original in [
+                format!("[keys]\nnext_agent = [\"{key}\"]\n"),
+                format!("[keys]\n[[keys.command]]\nkey = \"{key}\"\ntype = \"plugin_action\"\ncommand = \"someone.else.open\"\n"),
+            ] {
+                let (_directory, path) = write_config(&original);
+                assert!(install(&path).is_err(), "must detect {key}");
+                assert_eq!(fs::read_to_string(path).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn install_allows_distinct_shifted_or_modified_shortcuts() {
+        for key in ["alt+U", "alt+O", "alt+shift+quote", "ctrl+alt+quote"] {
+            let original = format!("[keys]\nnext_agent = \"{key}\"\n");
+            let (_directory, path) = write_config(&original);
+            assert!(install(&path).is_ok(), "must preserve distinct {key}");
+        }
+    }
+
+    #[test]
     fn install_refuses_a_builtin_alt_u_binding() {
         let original = "[keys]\nnext_agent = [\"ctrl+alt+j\", \"alt+u\"]\n";
         let (_directory, path) = write_config(original);
@@ -430,6 +504,7 @@ description = "Keep me"
             vec![
                 (UNREAD_KEY.into(), UNREAD_COMMAND.into()),
                 (WORKING_KEY.into(), WORKING_COMMAND.into()),
+                (RECENT_KEY.into(), RECENT_COMMAND.into()),
             ]
         );
     }
