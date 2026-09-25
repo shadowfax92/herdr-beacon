@@ -139,10 +139,15 @@ pub fn jump_unread(
         for pane_id in missing {
             state.remove_pane(&pane_id);
         }
+        // Retain the calling pane as a cursor even after its completion was
+        // acknowledged. Removing it would restart at newest on the next press,
+        // repeating a newer blocker before visiting the next older request.
         let mut candidates = agents
             .into_iter()
             .filter(|agent| {
-                agent.status == AgentStatus::Blocked || state.entries().contains_key(&agent.pane_id)
+                agent.status == AgentStatus::Blocked
+                    || state.entries().contains_key(&agent.pane_id)
+                    || is_current(agent, current_pane)
             })
             .collect::<Vec<_>>();
         sort_by_activity(&mut candidates);
@@ -516,7 +521,7 @@ mod tests {
             })
             .unwrap();
         let mut current = "w5:p1".to_string();
-        for expected in ["w1:p1", "w2:p1", "w1:p1", "w3:p1", "w4:p1", "w1:p1"] {
+        for expected in ["w1:p1", "w2:p1", "w3:p1", "w4:p1", "w1:p1", "w3:p1"] {
             assert_eq!(
                 jump_unread(&fake, &store, Some(&current)).unwrap(),
                 JumpOutcome::Focused(expected.to_string())
@@ -524,6 +529,22 @@ mod tests {
             current = expected.to_string();
         }
         assert!(store.read().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn unread_jump_wraps_from_an_acknowledged_completion_without_repeating_it() {
+        let (_temporary, store) = store();
+        let mut current = agent("w1:p1", AgentStatus::Idle, 4);
+        current.focused = true;
+        let fake = FakeHerdr::new(vec![current, agent("w2:p1", AgentStatus::Blocked, 12)]);
+        assert_eq!(
+            jump_unread(&fake, &store, Some("w1:p1")).unwrap(),
+            JumpOutcome::Focused("w2:p1".to_string())
+        );
+        assert_eq!(
+            jump_unread(&fake, &store, Some("w2:p1")).unwrap(),
+            JumpOutcome::Empty
+        );
     }
 
     #[test]

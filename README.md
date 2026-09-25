@@ -18,7 +18,7 @@ Beacon remembers background agents that finish and keeps blocked requests within
 | `Alt-o` | Currently working agents | Most recently started turn first |
 | `Alt-'` | Every live agent: working, blocked, done, idle, and unknown | Most recent activity first |
 
-Repeated presses advance from the current agent and wrap at the end; starting outside the eligible set selects its newest agent. Activity means Herdr's latest lifecycle transition (`state_change_seq`), not how often you focus a pane. Ties use pane ID, and each press refreshes the live order.
+Repeated presses advance from the current agent and wrap at the end. `Alt-u` retains your current pane's position after reading its completion, so newer blockers do not get repeated before older requests. `Alt-o` starts with the newest working turn when you are outside the working set; `Alt-'` starts with the newest agent when you are outside the agent set. Activity means Herdr's latest lifecycle transition (`state_change_seq`), not how often you focus a pane. Ties use pane ID, and each press refreshes the live order.
 
 - A new completion (`idle` or `done`) becomes unread when its state-change sequence advances beyond Beacon's last observation or acknowledgement.
 - An agent first encountered as `idle` establishes a baseline, not an unread entry. Existing `done` agents can seed the queue.
