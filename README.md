@@ -90,7 +90,9 @@ herdr plugin action invoke shadowfax.beacon.install-keybindings
 
 Herdr runs Beacon on agent-status, pane-focus, close, exit, detection, and move events. Beacon validates each event against the live `herdr agent` record, then stores only pane identity, attention status, and ordering metadata in its private plugin state directory.
 
-Herdr hook processes can finish out of order. Beacon orders entries with Herdr's `state_change_seq` and keeps per-terminal acknowledgement watermarks so a late completion hook cannot resurrect work that was already focused. Live API reads and state updates share a filesystem lock; state is saved in atomic private files. Existing v1 state files remain compatible.
+Herdr hook processes can finish out of order. Beacon orders entries with Herdr's `state_change_seq` and keeps per-terminal watermarks so a late completion hook cannot resurrect work that was already focused. A delayed pane-move hook merges both pane histories before retaining pending work. Only explicit focus or a superseding working/unknown observation can clear pending entries for the same terminal at or below its sequence; baselining an idle pane or pruning a missing address does not mean it was viewed. Live API reads and state updates share a filesystem lock; state is saved in atomic private files.
+
+Existing v1 state files remain readable. Watermarks now carry an optional `cleared_through` sequence to distinguish confirmed clearing evidence from passive observations. Legacy pending entries with ambiguous watermarks remain eligible until acknowledged. Older Beacon binaries reject the new watermark field, so retain a pre-upgrade state backup if planning a downgrade.
 
 Before every unread jump, Beacon reconciles the queue with `herdr agent list`. This recovers newer settled transitions even when a hook was missed, prunes stale entries, and rebases ordering after a Herdr server sequence reset. An unchanged `done` or `blocked` status cannot override Beacon's acknowledgement. Fresh idle/blocked snapshots are baselined rather than guessed to be unread.
 

@@ -52,15 +52,22 @@ pub struct UnreadEntry {
     pub ordinal: u64,
 }
 
+/// Observation history suppresses duplicate hooks; clearing history can consume
+/// pending work transferred from another pane address. Baselines and missing
+/// panes establish only the former, so these sequences must merge separately.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Watermark {
     terminal_id: String,
     state_change_seq: u64,
+    // Legacy v1 watermarks have no provenance. Keep any ambiguous pending entry
+    // until a focus or superseding lifecycle observation proves it can be cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleared_through: Option<u64>,
 }
 
-/// Beacon's unread ledger. Entries are pending transitions; watermarks are the
-/// last acknowledged or non-attention sequence for each terminal identity.
+/// Beacon's unread ledger. Entries are pending transitions; watermarks keep
+/// observed sequences and confirmed clearing evidence for each terminal identity.
 /// Herdr's server-side `seen`/`focused` flags do not own these acknowledgements.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,7 +103,7 @@ impl BeaconState {
             self.watermarks.remove(&observation.pane_id);
         }
         if source == ObservationSource::Focus || !observation.status.can_need_attention() {
-            self.clear_observation(&observation, reconciled);
+            self.clear_observation(&observation, source);
             return;
         }
 
@@ -109,7 +116,7 @@ impl BeaconState {
             && (observation.status == AgentStatus::Idle
                 || (observation.status == AgentStatus::Blocked && reconciled))
         {
-            self.clear_observation(&observation, reconciled);
+            self.clear_observation(&observation, source);
             return;
         }
 
@@ -128,7 +135,16 @@ impl BeaconState {
 
     pub fn remove_pane(&mut self, pane_id: &str) {
         if let Some(entry) = self.entries.remove(pane_id) {
-            self.advance_watermark(pane_id, &entry.terminal_id, entry.state_change_seq);
+            // A missing old address can be a move whose hook has not run yet.
+            // Suppress stale hooks here without claiming the completion was read.
+            self.merge_watermark(
+                pane_id,
+                Watermark {
+                    terminal_id: entry.terminal_id,
+                    state_change_seq: entry.state_change_seq,
+                    cleared_through: None,
+                },
+            );
         }
     }
 
@@ -161,6 +177,11 @@ impl BeaconState {
                 self.merge_watermark(pane_id, watermark);
             }
         }
+
+        // Focus/status hooks at the destination can run before this move hook.
+        // Merge both histories first, then let acknowledgements win over any
+        // pending transition they cover, whichever address held it originally.
+        self.discard_read_entry(pane_id);
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -196,6 +217,10 @@ impl BeaconState {
     }
 
     fn record_attention(&mut self, observation: AgentObservation, reconciled: bool) {
+        // A persisted pending entry is removable only with confirmed clearing
+        // evidence. A covering baseline (including ambiguous legacy state) must
+        // not consume work that reached this address through a delayed move.
+        self.discard_read_entry(&observation.pane_id);
         if let Some(watermark) = self.watermarks.get(&observation.pane_id) {
             if watermark.terminal_id == observation.terminal_id
                 && observation.state_change_seq <= watermark.state_change_seq
@@ -234,7 +259,22 @@ impl BeaconState {
         self.entries.insert(observation.pane_id, entry);
     }
 
-    fn clear_observation(&mut self, observation: &AgentObservation, reconciled: bool) {
+    fn discard_read_entry(&mut self, pane_id: &str) {
+        let cleared = self.entries.get(pane_id).is_some_and(|entry| {
+            self.watermarks.get(pane_id).is_some_and(|watermark| {
+                entry.terminal_id == watermark.terminal_id
+                    && watermark
+                        .cleared_through
+                        .is_some_and(|sequence| entry.state_change_seq <= sequence)
+            })
+        });
+        if cleared {
+            self.entries.remove(pane_id);
+        }
+    }
+
+    fn clear_observation(&mut self, observation: &AgentObservation, source: ObservationSource) {
+        let reconciled = source == ObservationSource::Reconcile;
         let should_remove = self.entries.get(&observation.pane_id).is_some_and(|entry| {
             reconciled
                 || entry.terminal_id != observation.terminal_id
@@ -243,37 +283,19 @@ impl BeaconState {
         if should_remove {
             self.entries.remove(&observation.pane_id);
         }
-        if reconciled {
-            self.rebase_watermark(
-                &observation.pane_id,
-                &observation.terminal_id,
-                observation.state_change_seq,
-            );
-        } else {
-            self.advance_watermark(
-                &observation.pane_id,
-                &observation.terminal_id,
-                observation.state_change_seq,
-            );
-        }
-    }
-
-    fn advance_watermark(&mut self, pane_id: &str, terminal_id: &str, sequence: u64) {
         let watermark = Watermark {
-            terminal_id: terminal_id.to_string(),
-            state_change_seq: sequence,
+            terminal_id: observation.terminal_id.clone(),
+            state_change_seq: observation.state_change_seq,
+            cleared_through: (source == ObservationSource::Focus
+                || !observation.status.can_need_attention())
+            .then_some(observation.state_change_seq),
         };
-        self.merge_watermark(pane_id, watermark);
-    }
-
-    fn rebase_watermark(&mut self, pane_id: &str, terminal_id: &str, sequence: u64) {
-        self.watermarks.insert(
-            pane_id.to_string(),
-            Watermark {
-                terminal_id: terminal_id.to_string(),
-                state_change_seq: sequence,
-            },
-        );
+        if reconciled {
+            self.watermarks
+                .insert(observation.pane_id.clone(), watermark);
+        } else {
+            self.merge_watermark(&observation.pane_id, watermark);
+        }
     }
 
     fn merge_watermark(&mut self, pane_id: &str, watermark: Watermark) {
@@ -281,6 +303,7 @@ impl BeaconState {
             Some(existing) if existing.terminal_id == watermark.terminal_id => {
                 existing.state_change_seq =
                     existing.state_change_seq.max(watermark.state_change_seq);
+                existing.cleared_through = existing.cleared_through.max(watermark.cleared_through);
             }
             _ => {
                 self.watermarks.insert(pane_id.to_string(), watermark);
