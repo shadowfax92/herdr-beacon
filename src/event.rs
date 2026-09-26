@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::eligibility;
 use crate::herdr::{Herdr, HerdrClient};
 use crate::model::ObservationSource;
 use crate::state::StateStore;
@@ -69,77 +70,74 @@ pub fn handle_event_json(
         bail!("Herdr event data type mismatch for {event_name}");
     }
 
-    match event_name {
-        "pane.agent_status_changed" => {
-            let data = parse_data::<PaneData>(envelope.data)?;
-            observe_live(herdr, store, &data.pane_id, false)
-        }
-        "pane.focused" => {
-            let data = parse_data::<PaneData>(envelope.data)?;
-            observe_live(herdr, store, &data.pane_id, true)
-        }
-        "pane.closed" | "pane.exited" => {
-            let data = parse_data::<PaneData>(envelope.data)?;
-            remove_if_missing(herdr, store, &data.pane_id)
-        }
+    let (target, source) = match event_name {
+        "pane.agent_status_changed" => (
+            Some(parse_data::<PaneData>(envelope.data)?.pane_id),
+            ObservationSource::Event,
+        ),
+        "pane.focused" => (
+            Some(parse_data::<PaneData>(envelope.data)?.pane_id),
+            ObservationSource::Focus,
+        ),
+        "pane.closed" | "pane.exited" => (
+            Some(parse_data::<PaneData>(envelope.data)?.pane_id),
+            ObservationSource::Reconcile,
+        ),
         "pane.agent_detected" => {
             let data = parse_data::<AgentDetectedData>(envelope.data)?;
-            if data.released {
-                remove_if_missing(herdr, store, &data.pane_id)
-            } else {
-                observe_live(herdr, store, &data.pane_id, false)
-            }
+            (
+                Some(data.pane_id),
+                if data.released {
+                    ObservationSource::Reconcile
+                } else {
+                    ObservationSource::Event
+                },
+            )
         }
         "pane.moved" => {
+            // Payload addresses may already be aliases of another move. Validate
+            // its shape, but only the fresh bulk snapshot owns identity/location.
             let data = parse_data::<MovedData>(envelope.data)?;
-            store.update(|state| {
-                let live = herdr.agent_get(&data.pane.pane_id)?;
-                state.move_pane(
-                    &data.previous_pane_id,
-                    &data.pane.pane_id,
-                    &data.pane.workspace_id,
-                    &data.pane.terminal_id,
-                );
-                if let Some(observation) = live {
-                    state.observe(observation, ObservationSource::Event);
-                }
-                Ok(())
-            })
+            let _ = (
+                &data.previous_pane_id,
+                &data.pane.workspace_id,
+                &data.pane.terminal_id,
+            );
+            (Some(data.pane.pane_id), ObservationSource::Event)
+        }
+        "workspace.created" | "workspace.closed" | "workspace.renamed" => {
+            (None, ObservationSource::Reconcile)
         }
         _ => bail!("unsupported Beacon event hook: {event_name}"),
-    }
-}
-
-fn observe_live(
-    herdr: &impl HerdrClient,
-    store: &StateStore,
-    pane_id: &str,
-    explicit_focus: bool,
-) -> Result<()> {
+    };
+    // Policy failures must commit recovery evidence before returning an error.
+    // Reads and lifecycle writes share the lock across all hook processes.
     store.update(|state| {
-        // Hooks run in separate processes. Fetch under the same lock as the
-        // mutation so a delayed hook cannot apply an older live snapshot.
-        if let Some(observation) = herdr.agent_get(pane_id)? {
-            let source = if explicit_focus {
-                ObservationSource::Focus
+        let agents = match eligibility::reconcile(herdr, state) {
+            Ok(agents) => agents,
+            Err(error) => return Ok(Err(error)),
+        };
+        let live: std::collections::BTreeSet<_> =
+            agents.iter().map(|a| a.pane_id.clone()).collect();
+        for observation in agents {
+            let source = if target.as_deref() == Some(&observation.pane_id) {
+                source
             } else {
-                ObservationSource::Event
+                ObservationSource::Reconcile
             };
             state.observe(observation, source);
-        } else {
-            state.remove_pane(pane_id);
         }
-        Ok(())
-    })
-}
-
-fn remove_if_missing(herdr: &impl HerdrClient, store: &StateStore, pane_id: &str) -> Result<()> {
-    store.update(|state| {
-        if herdr.agent_get(pane_id)?.is_none() {
-            state.remove_pane(pane_id);
+        let missing: Vec<_> = state
+            .entries()
+            .keys()
+            .filter(|p| !live.contains(*p))
+            .cloned()
+            .collect();
+        for pane in missing {
+            state.remove_pane(&pane);
         }
-        Ok(())
-    })
+        Ok(Ok(()))
+    })?
 }
 
 fn parse_data<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
@@ -164,6 +162,20 @@ mod tests {
     }
 
     impl HerdrClient for FakeHerdr {
+        fn workspace_policy(&self) -> Result<crate::eligibility::WorkspacePolicy> {
+            let agents = self.agents.values().cloned().collect::<Vec<_>>();
+            let mut ids: std::collections::BTreeSet<_> =
+                agents.iter().map(|a| a.workspace_id.clone()).collect();
+            ids.extend(["w1", "w2", "w3", "w4", "w5", "w9"].map(str::to_string));
+            crate::eligibility::WorkspacePolicy::from_reply(
+                &serde_json::to_vec(&serde_json::json!({
+                    "ok":true,"version":1,"herdr_socket":"/test.sock","excluded_labels":[],
+                    "workspace_ids":ids,"excluded_workspace_ids":[],"show_excluded":false
+                }))?,
+                "/test.sock",
+            )
+        }
+
         fn agent_get(&self, pane_id: &str) -> Result<Option<AgentObservation>> {
             Ok(self.agents.get(pane_id).cloned())
         }

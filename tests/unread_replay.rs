@@ -18,6 +18,20 @@ struct FakeHerdr {
 }
 
 impl HerdrClient for FakeHerdr {
+    fn workspace_policy(&self) -> Result<herdr_beacon::eligibility::WorkspacePolicy> {
+        let agents = self.agents.borrow().clone();
+        let mut ids: std::collections::BTreeSet<_> =
+            agents.iter().map(|a| a.workspace_id.clone()).collect();
+        ids.extend(["w1", "w2", "w3", "w4", "w5", "w9"].map(str::to_string));
+        herdr_beacon::eligibility::WorkspacePolicy::from_reply(
+            &serde_json::to_vec(&serde_json::json!({
+                "ok":true,"version":1,"herdr_socket":"/test.sock","excluded_labels":[],
+                "workspace_ids":ids,"excluded_workspace_ids":[],"show_excluded":false
+            }))?,
+            "/test.sock",
+        )
+    }
+
     fn agent_get(&self, pane_id: &str) -> Result<Option<AgentObservation>> {
         Ok(self
             .agents

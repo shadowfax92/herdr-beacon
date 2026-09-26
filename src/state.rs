@@ -238,6 +238,6 @@ mod tests {
 
         let error = store.read().unwrap_err();
 
-        assert!(error.to_string().contains("version 99"));
+        assert!(format!("{error:#}").contains("version 99"));
     }
 }

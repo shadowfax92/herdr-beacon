@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+pub mod eligibility;
 pub mod event;
 pub mod herdr;
 pub mod jump;

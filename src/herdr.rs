@@ -8,7 +8,9 @@ use serde_json::Value;
 
 use crate::model::{AgentObservation, AgentStatus};
 
+/// Host operations and the external policy seam used by hooks and navigation.
 pub trait HerdrClient {
+    fn workspace_policy(&self) -> Result<crate::eligibility::WorkspacePolicy>;
     fn agent_get(&self, pane_id: &str) -> Result<Option<AgentObservation>>;
     fn agent_list(&self) -> Result<Vec<AgentObservation>>;
     fn focus_agent(&self, pane_id: &str) -> Result<AgentObservation>;
@@ -48,6 +50,9 @@ impl Herdr {
 }
 
 impl HerdrClient for Herdr {
+    fn workspace_policy(&self) -> Result<crate::eligibility::WorkspacePolicy> {
+        crate::eligibility::from_environment()
+    }
     fn agent_get(&self, pane_id: &str) -> Result<Option<AgentObservation>> {
         let invocation = self.invoke(&strings(&["agent", "get", pane_id]))?;
         if error_code(&invocation.value) == Some("agent_not_found") {
