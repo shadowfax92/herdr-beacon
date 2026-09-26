@@ -602,3 +602,75 @@ fn tests_that_preflight_eligible_move_retains_unviewed_completion() {
         assert_eq!(f.focuses(), ["moved"]);
     }
 }
+
+#[test]
+fn tests_that_xdg_unset_and_empty_fall_back_but_nonempty_is_respected() {
+    for xdg in [None, Some(""), Some("xdg")] {
+        let f = Fixture::new();
+        f.live(vec![agent("a", "working", 8)]);
+        let short = tempfile::Builder::new()
+            .prefix("bpx-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = short.path().join("home");
+        let root = match xdg {
+            Some("xdg") => short.path().join("xdg/herdr/plugins/shadowfax.agents"),
+            _ => home.join(".local/state/herdr/plugins/shadowfax.agents"),
+        };
+        let server = PolicyServer::new(&root, &["a", "d"], &["a"]);
+        let mut command = f.command("jump-working");
+        // Change HOME only for this child, never the owner or test process.
+        command.env_remove("HERDR_AGENTS_STATE").env("HOME", &home);
+        match xdg {
+            None => {
+                command.env_remove("XDG_STATE_HOME");
+            }
+            Some("") => {
+                command.env("XDG_STATE_HOME", "");
+            }
+            Some(_) => {
+                command.env("XDG_STATE_HOME", short.path().join("xdg"));
+            }
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "XDG={xdg:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(f.focuses().is_empty());
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert!(f.policy.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn tests_that_explicit_agents_override_keeps_empty_and_nonempty_semantics() {
+    for empty in [false, true] {
+        let f = Fixture::new();
+        f.live(vec![agent("a", "working", 8)]);
+        let short = tempfile::Builder::new()
+            .prefix("bpo-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let server = PolicyServer::new(short.path(), &["a", "d"], &["a"]);
+        let mut command = f.command("jump-working");
+        command.env("XDG_STATE_HOME", short.path().join("unused"));
+        if empty {
+            command
+                .env("HERDR_AGENTS_STATE", "")
+                .current_dir(short.path());
+        } else {
+            command.env("HERDR_AGENTS_STATE", short.path());
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(f.focuses().is_empty());
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert!(f.policy.requests.lock().unwrap().is_empty());
+    }
+}
