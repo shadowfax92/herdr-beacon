@@ -94,7 +94,9 @@ pub(crate) fn from_environment() -> Result<WorkspacePolicy> {
     let root = if let Some(root) = std::env::var_os("HERDR_AGENTS_STATE") {
         PathBuf::from(root)
     } else {
-        let state = match std::env::var_os("XDG_STATE_HOME") {
+        // The contract uses shell :- semantics: an exported empty XDG value
+        // falls back to HOME. The explicit Agents override above stays literal.
+        let state = match std::env::var_os("XDG_STATE_HOME").filter(|root| !root.is_empty()) {
             Some(root) => PathBuf::from(root),
             None => PathBuf::from(std::env::var_os("HOME").context("HOME is required")?)
                 .join(".local/state"),
