@@ -10,7 +10,7 @@
 
 </div>
 
-Beacon remembers background agents that finish and keeps blocked requests within reach.
+Beacon remembers background agents that finish and keeps blocked requests within reach. Workspaces excluded in Agents configuration are always omitted from Beacon tracking and every shortcut, even when their sidebar rows are shown.
 
 | Shortcut | Agents included | Order |
 | --- | --- | --- |
@@ -27,12 +27,12 @@ Repeated presses advance from the current agent and wrap at the end. `Alt-u` ret
 - A pane-focus event, successful unread jump, or invoking `Alt-u` from a pane marks its Beacon entry read.
 - Closed, exited, running, unknown, and missing agents are removed from the unread queue automatically.
 - With no other unread or blocked destination, `Alt-u` requests a soundless notification. Herdr may suppress it without making the shortcut fail.
-- Working and recent-activity navigation read the live agent list without directly changing queue state; normal focus hooks still acknowledge viewed work.
+- All four modes reconcile the shared eligibility and unread ledger before selection. Successful navigation records confirmed focus evidence without enrolling new work.
 - `Alt-o` covers working and blocked agents. `Alt-'` and `Shift-Alt-'` skip both states and refresh their membership on every press.
 
 ## Install
 
-Requires macOS or Linux (including WSL), Herdr 0.7.5 or newer, and a Rust toolchain.
+Requires macOS or Linux (including WSL), Herdr 0.7.5 or newer, a Rust toolchain, and a running compatible `shadowfax.agents` daemon implementing workspace-policy protocol v1. Deploy compatible Agents and Beacon versions together; missing or older Agents pauses Beacon tracking and navigation.
 
 On Windows, run Herdr and this plugin inside WSL. Native Windows is not supported.
 
@@ -88,15 +88,21 @@ herdr plugin action invoke shadowfax.beacon.install-keybindings
 
 ## How it works
 
-Herdr runs Beacon on agent-status, pane-focus, close, exit, detection, and move events. Beacon validates each event against the live `herdr agent` record, then stores only pane identity, attention status, and ordering metadata in its private plugin state directory.
+Herdr runs Beacon on agent-status, pane-focus, close, exit, detection, move, and workspace create/close/rename events. Every hook and jump reads one bulk Agents policy and the canonical `herdr agent list` under Beacon's filesystem state lock. Policy is applied before observing lifecycle changes or selecting destinations, so correctness also survives missing or delayed hooks. Pane aliases merge by terminal identity; event payload addresses cannot override a newer live location.
 
-Herdr hook processes can finish out of order. Beacon orders entries with Herdr's `state_change_seq` and keeps per-terminal watermarks so a late completion hook cannot resurrect work that was already focused. A delayed pane-move hook merges both pane histories before retaining pending work. Only explicit focus or a superseding working/unknown observation can clear pending entries for the same terminal at or below its sequence; baselining an idle pane or pruning a missing address does not mean it was viewed. Live API reads and state updates share a filesystem lock; state is saved in atomic private files.
+Agents owns `[workspace_visibility].excluded_labels` and exact, case-sensitive label matching. Beacon does not parse that config, hardcode a workspace label, or use `attention_scope`. A valid empty policy is unrestricted over the returned known workspace IDs. Showing/hiding Agents rows changes neither eligibility nor unread history.
 
-Existing v1 state files remain readable. Watermarks now carry an optional `cleared_through` sequence to distinguish confirmed clearing evidence from passive observations. Legacy pending entries with ambiguous watermarks remain eligible until acknowledged. Older Beacon binaries reject the new watermark field, so retain a pre-upgrade state backup if planning a downgrade.
+The adapter connects directly to `${HERDR_AGENTS_STATE}/control.sock` when set, otherwise `${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/shadowfax.agents/control.sock`. Caller plugin config/state directories are never used for Agents discovery. `HERDR_SOCKET_PATH` is required and normalized lexically; Agents must echo the same session. One whole-request deadline of two seconds covers connect/write/read, with a 256 KiB reply cap and strict version, field type, sorted-set, and set-inclusion checks. `socket2` supplies bounded Unix connection setup.
 
-Before every unread jump, Beacon reconciles the queue with `herdr agent list`. This recovers newer settled transitions even when a hook was missed, prunes stale entries, and rebases ordering after a Herdr server sequence reset. An unchanged `done` or `blocked` status cannot override Beacon's acknowledgement. Fresh idle/blocked snapshots are baselined rather than guessed to be unread.
+Missing/stopped/old Agents, invalid policy, wrong session, or transport failure stops navigation and records recovery-needed evidence. An unknown workspace is unresolved and never enrolled or focused. Exclusion removes all navigable records and pane aliases, retaining only terminal/sequence suppression and any confirmed clearing evidence. Policy removal, rename/move out, or recovery baselines the current completion; a later eligible completion can become unread. Blocked/working agents can rejoin their normal categories immediately. Newly encountered identities across a config-change gap are conservatively baselined.
 
-Working and recent-activity jumps read the same live agent list but never touch persisted queue state. Herdr's `state_change_seq` supplies the recency order. The action's `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id` (or `HERDR_PANE_ID`) supplies the cycle cursor, rather than another client's server focus. Standalone commands without pane context fall back to API focus.
+Herdr hook processes can finish out of order. Beacon orders entries by `state_change_seq` and keeps passive observation watermarks separate from confirmed `cleared_through` evidence. A focus or superseding working/unknown observation can clear pending work; an idle baseline or missing pane address does not prove it was viewed. Unchanged status painting does not override acknowledgements. A lower fresh sequence at the same socket path establishes a new baseline instead of replaying pre-restart history.
+
+State writes use locked, atomic, private files. The explicit **v1 → v2 migration** preserves entries and optional `cleared_through` values, then reconciles affected identities against fresh policy. Ambiguous legacy pending entries remain eligible absent an actual policy transition, recovery, or acknowledgement. V2 persists policy label identity, session, exclusion membership, eligible terminal locations, and minimal suppression/recovery evidence. Unknown fields and incomplete v2 files are errors and are not overwritten.
+
+Before deployment, back up the current `state.json` while Beacon writers are quiescent. **Downgrade requires restoring a compatible pre-upgrade state backup:** older binaries reject v2, and deleting policy fields or editing its version loses the recovery contract. Restoring a backup can replay acknowledgements made after capture, and the older binary no longer enforces workspace exclusions. The mediator owns coordinated installation and rollback; this repository's tests use private state only.
+
+The action's `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_id` (or `HERDR_PANE_ID`) supplies the cycle cursor rather than another client's server focus. Standalone commands without pane context fall back to API focus. Immediately before focus, Beacon performs one fresh identity/workspace lookup and one fresh policy read outside its state lock. A changed/moved/excluded target is refused. Successful jumps use two policy requests regardless of candidate count; no per-pane policy requests or subprocesses are created. Herdr has no conditional focus transaction, so a concurrent change after the final check remains a narrow race.
 
 All four shortcuts focus the agent and then explicitly focus its returned tab. Herdr 0.9's `agent focus` alone can report success without switching the visible TUI tab. The explicit tab focus also affects other TUI clients attached to the same server.
 
@@ -121,18 +127,17 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-To verify actual TUI navigation with an installed Herdr (each run creates and stops its own isolated test server; set `BEACON_TEST_SHORTCUT=1` to send the real shortcut):
+The Rust CLI suite uses fake Agents sockets, a private fake Herdr executable, and private ledgers. It covers every mode, show/hide independence, protocol failures, request bounds, topology changes, migration, recovery, and the unread move regressions.
+
+To test an actual built Agents daemon and Beacon CLI against a private fake host (no live focus, UI, or installation):
 
 ```sh
-python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-working tab
-python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-unread tab
-python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-working workspace
-python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-unread workspace
-python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-unread workspace blocked
-python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-recent tab idle
-python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-recent workspace idle
-BEACON_TEST_SHORTCUT=1 python3 tests/real_tui_navigation.py target/release/herdr-beacon jump-recent-reverse workspace idle
+python3 tests/agents_read_contract.py --agents /absolute/herdr-agents \
+  --beacon target/release/herdr-beacon --agents-sha256 <expected-sha256> \
+  --output /absolute/read-contract-evidence.json
 ```
+
+This read-interface test preseeds only fixture visibility. It does not claim Menu toggle or completed Agents visibility-SET integration; those are separate deployment gates. The historical `real_tui_navigation.py` harness requires an explicitly authorized UI test session and a compatible policy endpoint.
 
 ## Remove
 

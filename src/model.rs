@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,16 +66,86 @@ struct Watermark {
     cleared_through: Option<u64>,
 }
 
+/// Membership is independent of display visibility. Suppression has no pane
+/// address or status, so excluded/unresolved terminals cannot become candidates.
+/// Its watermark retains acknowledgements separately from policy baselines.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyHistory {
+    session: Option<String>,
+    labels: Option<Vec<String>>,
+    excluded: BTreeSet<String>,
+    locations: BTreeMap<String, String>,
+    suppressed: BTreeMap<String, Watermark>,
+    recovery_needed: bool,
+}
+
 /// Beacon's unread ledger. Entries are pending transitions; watermarks keep
 /// observed sequences and confirmed clearing evidence for each terminal identity.
 /// Herdr's server-side `seen`/`focused` flags do not own these acknowledgements.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct BeaconState {
     version: u32,
     next_ordinal: u64,
     entries: BTreeMap<String, UnreadEntry>,
     watermarks: BTreeMap<String, Watermark>,
+    policy: PolicyHistory,
+}
+
+// Version dispatch is explicit: v1 accepts only the original fields and v2
+// requires its complete policy history. Unknown fields or partially written new
+// state fail closed instead of silently resetting suppression/acknowledgements.
+impl<'de> Deserialize<'de> for BeaconState {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1 {
+            version: u32,
+            next_ordinal: u64,
+            entries: BTreeMap<String, UnreadEntry>,
+            watermarks: BTreeMap<String, Watermark>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V2 {
+            version: u32,
+            next_ordinal: u64,
+            entries: BTreeMap<String, UnreadEntry>,
+            watermarks: BTreeMap<String, Watermark>,
+            policy: PolicyHistory,
+        }
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("version").and_then(|v| v.as_u64()) {
+            Some(1) => {
+                let old: V1 = serde_json::from_value(value).map_err(D::Error::custom)?;
+                let _ = old.version;
+                Ok(Self {
+                    version: STATE_VERSION,
+                    next_ordinal: old.next_ordinal,
+                    entries: old.entries,
+                    watermarks: old.watermarks,
+                    policy: PolicyHistory::default(),
+                })
+            }
+            Some(2) => {
+                let new: V2 = serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(Self {
+                    version: new.version,
+                    next_ordinal: new.next_ordinal,
+                    entries: new.entries,
+                    watermarks: new.watermarks,
+                    policy: new.policy,
+                })
+            }
+            version => Err(D::Error::custom(format!(
+                "unsupported Beacon state version {}",
+                version.map_or("missing".into(), |v| v.to_string())
+            ))),
+        }
+    }
 }
 
 impl Default for BeaconState {
@@ -85,11 +155,246 @@ impl Default for BeaconState {
             next_ordinal: 0,
             entries: BTreeMap::new(),
             watermarks: BTreeMap::new(),
+            policy: PolicyHistory::default(),
         }
     }
 }
 
 impl BeaconState {
+    /// A successful focus is evidence, not lifecycle enrollment. Apply it only
+    /// to the selected sequence still present in this ledger epoch. A hook may
+    /// have moved/suppressed the terminal while focus ran outside the lock.
+    pub(crate) fn acknowledge_selected(&mut self, selected: &AgentObservation) {
+        if let Some(mark) = self.policy.suppressed.get_mut(&selected.terminal_id) {
+            if mark.state_change_seq == selected.state_change_seq {
+                mark.cleared_through = mark.cleared_through.max(Some(selected.state_change_seq));
+            }
+            return;
+        }
+        let addresses: BTreeSet<_> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.terminal_id == selected.terminal_id)
+            .map(|(p, _)| p.clone())
+            .chain(
+                self.watermarks
+                    .iter()
+                    .filter(|(_, w)| w.terminal_id == selected.terminal_id)
+                    .map(|(p, _)| p.clone()),
+            )
+            .collect();
+        for pane in addresses {
+            let mut observation = selected.clone();
+            observation.pane_id = pane.clone();
+            if self.known_sequence(&observation) == Some(selected.state_change_seq) {
+                self.merge_watermark(
+                    &pane,
+                    Watermark {
+                        terminal_id: selected.terminal_id.clone(),
+                        state_change_seq: selected.state_change_seq,
+                        cleared_through: Some(selected.state_change_seq),
+                    },
+                );
+                self.discard_read_entry(&pane);
+            }
+        }
+    }
+
+    pub(crate) fn invalidate_target(&mut self, terminal: &str) {
+        self.suppress(terminal, None);
+    }
+
+    pub(crate) fn policy_unavailable(&mut self) {
+        let terminals: BTreeSet<_> = self
+            .entries
+            .values()
+            .map(|e| e.terminal_id.clone())
+            .chain(self.watermarks.values().map(|w| w.terminal_id.clone()))
+            .collect();
+        for terminal in terminals {
+            self.suppress(&terminal, None);
+        }
+        self.policy.recovery_needed = true;
+    }
+
+    /// Canonical live identities supersede delayed move payloads. Reconcile all
+    /// aliases before observing status, then filter once for every caller/mode.
+    pub(crate) fn apply_policy(
+        &mut self,
+        policy: &crate::eligibility::WorkspacePolicy,
+        agents: Vec<AgentObservation>,
+    ) -> Vec<AgentObservation> {
+        let changed_session = self
+            .policy
+            .session
+            .as_ref()
+            .is_some_and(|s| s != &policy.session);
+        if changed_session {
+            self.policy_unavailable();
+        }
+        let recovering = self.policy.recovery_needed;
+        let config_changed = self
+            .policy
+            .labels
+            .as_ref()
+            .is_some_and(|labels| labels != &policy.labels);
+        // Missing identities still carry their last known membership. Excluding
+        // that workspace must remove their pending aliases too, even without hooks.
+        let live_terminals: BTreeSet<_> = agents.iter().map(|a| &a.terminal_id).collect();
+        let absent_excluded: BTreeSet<_> = self
+            .entries
+            .values()
+            .filter(|e| {
+                !live_terminals.contains(&e.terminal_id) && !policy.eligible(&e.workspace_id)
+            })
+            .map(|e| e.terminal_id.clone())
+            .chain(
+                self.policy
+                    .locations
+                    .iter()
+                    .filter(|(t, w)| !live_terminals.contains(t) && !policy.eligible(w))
+                    .map(|(t, _)| t.clone()),
+            )
+            .collect();
+        for terminal in absent_excluded {
+            self.suppress(&terminal, None);
+        }
+        let mut eligible = Vec::new();
+        for observation in agents {
+            let terminal = &observation.terminal_id;
+            if !policy.eligible(&observation.workspace_id) {
+                self.suppress(terminal, Some(&observation));
+                continue;
+            }
+            self.canonicalize(&observation);
+            let reentered_workspace = self.policy.excluded.contains(&observation.workspace_id);
+            let reset = self
+                .known_sequence(&observation)
+                .is_some_and(|seq| observation.state_change_seq < seq);
+            let suppressed = self.policy.suppressed.remove(terminal);
+            // A config edit across an observation gap leaves new identities'
+            // prior membership unknown. Baseline them, preserving known unrelated
+            // terminals and treating show/hide (same labels) as no transition.
+            let uncertain_membership =
+                config_changed && !self.policy.locations.contains_key(terminal);
+            if recovering
+                || reentered_workspace
+                || suppressed.is_some()
+                || reset
+                || uncertain_membership
+            {
+                // Policy removal and recovery intentionally consume uncertain
+                // historical work without fabricating focus/cleared-through proof.
+                let mut watermark = suppressed.unwrap_or(Watermark {
+                    terminal_id: terminal.clone(),
+                    state_change_seq: observation.state_change_seq,
+                    cleared_through: None,
+                });
+                if reset || observation.state_change_seq < watermark.state_change_seq {
+                    watermark.cleared_through = None; // New server sequence epoch.
+                }
+                watermark.state_change_seq = observation.state_change_seq;
+                self.entries.remove(&observation.pane_id);
+                // Existing acknowledgement survives a baseline in this epoch,
+                // but an epoch reset must not retain its old numeric horizon.
+                if !reset {
+                    if let Some(previous) = self.watermarks.get(&observation.pane_id) {
+                        if previous.terminal_id == *terminal {
+                            watermark.cleared_through =
+                                watermark.cleared_through.max(previous.cleared_through);
+                        }
+                    }
+                }
+                self.watermarks
+                    .insert(observation.pane_id.clone(), watermark);
+            }
+            self.policy
+                .locations
+                .insert(terminal.clone(), observation.workspace_id.clone());
+            eligible.push(observation);
+        }
+        self.policy.session = Some(policy.session.clone());
+        self.policy.labels = Some(policy.labels.clone());
+        self.policy.excluded = policy.excluded.clone();
+        self.policy.recovery_needed = false;
+        eligible
+    }
+
+    fn suppress(&mut self, terminal: &str, live: Option<&AgentObservation>) {
+        let mut evidence = self
+            .policy
+            .suppressed
+            .remove(terminal)
+            .unwrap_or(Watermark {
+                terminal_id: terminal.to_string(),
+                state_change_seq: 0,
+                cleared_through: None,
+            });
+        for watermark in self
+            .watermarks
+            .values()
+            .filter(|w| w.terminal_id == terminal)
+        {
+            evidence.state_change_seq = evidence.state_change_seq.max(watermark.state_change_seq);
+            evidence.cleared_through = evidence.cleared_through.max(watermark.cleared_through);
+        }
+        for entry in self.entries.values().filter(|e| e.terminal_id == terminal) {
+            evidence.state_change_seq = evidence.state_change_seq.max(entry.state_change_seq);
+        }
+        if let Some(live) = live {
+            if live.state_change_seq < evidence.state_change_seq {
+                evidence.cleared_through = None;
+            }
+            evidence.state_change_seq = live.state_change_seq;
+        }
+        self.entries.retain(|_, e| e.terminal_id != terminal);
+        self.watermarks.retain(|_, w| w.terminal_id != terminal);
+        self.policy.locations.remove(terminal);
+        self.policy
+            .suppressed
+            .insert(terminal.to_string(), evidence);
+    }
+
+    fn canonicalize(&mut self, observation: &AgentObservation) {
+        // A recreated pane occupant cannot inherit pending work from its prior
+        // terminal. Drop destination-only history before merging this terminal's
+        // aliases, otherwise its acknowledged watermark can mask a foreign entry.
+        if self
+            .entries
+            .get(&observation.pane_id)
+            .is_some_and(|e| e.terminal_id != observation.terminal_id)
+        {
+            self.entries.remove(&observation.pane_id);
+        }
+        if self
+            .watermarks
+            .get(&observation.pane_id)
+            .is_some_and(|w| w.terminal_id != observation.terminal_id)
+        {
+            self.watermarks.remove(&observation.pane_id);
+        }
+        let aliases: BTreeSet<_> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.terminal_id == observation.terminal_id)
+            .map(|(p, _)| p.clone())
+            .chain(
+                self.watermarks
+                    .iter()
+                    .filter(|(_, w)| w.terminal_id == observation.terminal_id)
+                    .map(|(p, _)| p.clone()),
+            )
+            .collect();
+        for pane in aliases {
+            self.move_pane(
+                &pane,
+                &observation.pane_id,
+                &observation.workspace_id,
+                &observation.terminal_id,
+            );
+        }
+    }
+
     pub fn observe(&mut self, observation: AgentObservation, source: ObservationSource) {
         let reconciled = source == ObservationSource::Reconcile;
         let known_sequence = self.known_sequence(&observation);

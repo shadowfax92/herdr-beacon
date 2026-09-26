@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::eligibility;
 use crate::herdr::{Herdr, HerdrClient};
 use crate::model::{AgentObservation, AgentStatus, ObservationSource};
 use crate::state::StateStore;
@@ -29,17 +30,29 @@ pub fn jump_from_environment() -> Result<JumpOutcome> {
 
 pub fn jump_working_from_environment() -> Result<JumpOutcome> {
     let pane = invocation_pane();
-    jump_working(&Herdr::from_environment(), pane.as_deref())
+    jump_working(
+        &Herdr::from_environment(),
+        &StateStore::from_environment()?,
+        pane.as_deref(),
+    )
 }
 
 pub fn jump_recent_from_environment() -> Result<JumpOutcome> {
     let pane = invocation_pane();
-    jump_recent(&Herdr::from_environment(), pane.as_deref())
+    jump_recent(
+        &Herdr::from_environment(),
+        &StateStore::from_environment()?,
+        pane.as_deref(),
+    )
 }
 
 pub fn jump_recent_reverse_from_environment() -> Result<JumpOutcome> {
     let pane = invocation_pane();
-    jump_recent_reverse(&Herdr::from_environment(), pane.as_deref())
+    jump_recent_reverse(
+        &Herdr::from_environment(),
+        &StateStore::from_environment()?,
+        pane.as_deref(),
+    )
 }
 
 /// Only action entrypoints read this context. A hook's identically named pane
@@ -66,61 +79,103 @@ fn is_current(agent: &crate::model::AgentObservation, current_pane: Option<&str>
     current_pane.map_or(agent.focused, |pane| agent.pane_id == pane)
 }
 
-/// Advances through working and blocked agents without directly changing the unread queue.
-/// Herdr's status sequence supplies a cross-workspace recency order; the current
-/// eligible pane is the cursor, so every active or waiting turn is reachable.
-pub fn jump_working(herdr: &impl HerdrClient, current_pane: Option<&str>) -> Result<JumpOutcome> {
-    let active_turns = herdr
-        .agent_list()?
-        .into_iter()
-        .filter(is_active_turn)
-        .collect();
+/// All navigation modes reconcile policy/history, even those selecting solely
+/// by live status. This prevents excluded turns resurfacing on a later Alt-U.
+pub fn jump_working(
+    herdr: &impl HerdrClient,
+    store: &StateStore,
+    current_pane: Option<&str>,
+) -> Result<JumpOutcome> {
+    let agents = reconcile_navigation(herdr, store, current_pane)?;
     jump_in_activity_order(
         herdr,
-        active_turns,
+        store,
+        agents.into_iter().filter(is_active_turn).collect(),
         current_pane,
         "No working or blocked agents",
         Direction::Forward,
     )
 }
 
-/// Working and blocked turns belong to Alt-O. Both recent-activity directions
-/// use its complement, leaving unread completions eligible without consulting or
-/// mutating the unread ledger. Normal focus hooks still acknowledge viewed work.
 fn is_active_turn(agent: &AgentObservation) -> bool {
     matches!(agent.status, AgentStatus::Working | AgentStatus::Blocked)
 }
 
-pub fn jump_recent(herdr: &impl HerdrClient, current_pane: Option<&str>) -> Result<JumpOutcome> {
-    jump_recent_in_direction(herdr, current_pane, Direction::Forward)
-}
-
-/// Walks back toward newer activity in the same filtered ring as `jump_recent`.
-/// From a working/blocked pane or non-agent pane, start at the oldest eligible agent.
-pub fn jump_recent_reverse(
+pub fn jump_recent(
     herdr: &impl HerdrClient,
+    store: &StateStore,
     current_pane: Option<&str>,
 ) -> Result<JumpOutcome> {
-    jump_recent_in_direction(herdr, current_pane, Direction::Backward)
+    jump_recent_in_direction(herdr, store, current_pane, Direction::Forward)
+}
+
+/// The same eligible ring in reverse, with stable ties and wraparound.
+pub fn jump_recent_reverse(
+    herdr: &impl HerdrClient,
+    store: &StateStore,
+    current_pane: Option<&str>,
+) -> Result<JumpOutcome> {
+    jump_recent_in_direction(herdr, store, current_pane, Direction::Backward)
 }
 
 fn jump_recent_in_direction(
     herdr: &impl HerdrClient,
+    store: &StateStore,
     current_pane: Option<&str>,
     direction: Direction,
 ) -> Result<JumpOutcome> {
-    // Membership is refreshed for every press: a newly completed turn joins the
-    // cycle immediately, and an agent that resumes work or blocks leaves it.
-    let agents = herdr
-        .agent_list()?
-        .into_iter()
-        .filter(|agent| !is_active_turn(agent))
+    let agents = reconcile_navigation(herdr, store, current_pane)?;
+    jump_in_activity_order(
+        herdr,
+        store,
+        agents.into_iter().filter(|a| !is_active_turn(a)).collect(),
+        current_pane,
+        "No eligible agents",
+        direction,
+    )
+}
+
+fn reconcile_navigation(
+    herdr: &impl HerdrClient,
+    store: &StateStore,
+    current_pane: Option<&str>,
+) -> Result<Vec<AgentObservation>> {
+    store.update(|state| {
+        let agents = match eligibility::reconcile(herdr, state) {
+            Ok(agents) => agents,
+            Err(error) => return Ok(Err(error)),
+        };
+        observe_navigation(state, &agents, current_pane);
+        Ok(Ok(agents))
+    })?
+}
+
+fn observe_navigation(
+    state: &mut crate::model::BeaconState,
+    agents: &[AgentObservation],
+    current_pane: Option<&str>,
+) {
+    let live: BTreeSet<_> = agents.iter().map(|a| &a.pane_id).collect();
+    for agent in agents {
+        state.observe(agent.clone(), ObservationSource::Reconcile);
+        if is_current(agent, current_pane) {
+            state.observe(agent.clone(), ObservationSource::Focus);
+        }
+    }
+    let missing: Vec<_> = state
+        .entries()
+        .keys()
+        .filter(|p| !live.contains(p))
+        .cloned()
         .collect();
-    jump_in_activity_order(herdr, agents, current_pane, "No eligible agents", direction)
+    for pane in missing {
+        state.remove_pane(&pane);
+    }
 }
 
 fn jump_in_activity_order(
     herdr: &impl HerdrClient,
+    store: &StateStore,
     mut agents: Vec<AgentObservation>,
     current_pane: Option<&str>,
     empty_message: &str,
@@ -131,11 +186,70 @@ fn jump_in_activity_order(
         herdr.notify(empty_message, None)?;
         return Ok(JumpOutcome::Empty);
     }
-    let pane_id = agents[cycle_index(&agents, current_pane, direction)]
-        .pane_id
-        .clone();
-    herdr.focus_agent(&pane_id)?;
-    Ok(JumpOutcome::Focused(pane_id))
+    focus_selected(
+        herdr,
+        store,
+        &agents[cycle_index(&agents, current_pane, direction)],
+    )
+}
+
+/// This constant-work preflight runs outside the ledger lock. Herdr has no
+/// conditional focus transaction: a move after these reads remains a narrow race.
+fn focus_selected(
+    herdr: &impl HerdrClient,
+    store: &StateStore,
+    selected: &AgentObservation,
+) -> Result<JumpOutcome> {
+    enum Preflight {
+        Eligible,
+        Ineligible,
+        IdentityChanged,
+    }
+    let check = (|| {
+        let current = herdr.agent_get(&selected.pane_id)?;
+        let policy = herdr.workspace_policy()?;
+        let Some(current) = current else {
+            return Ok(Preflight::IdentityChanged);
+        };
+        if current.terminal_id != selected.terminal_id {
+            return Ok(Preflight::IdentityChanged);
+        }
+        if !policy.eligible(&current.workspace_id) {
+            return Ok(Preflight::Ineligible);
+        }
+        if current.pane_id != selected.pane_id || current.workspace_id != selected.workspace_id {
+            return Ok(Preflight::IdentityChanged);
+        }
+        Ok(Preflight::Eligible)
+    })();
+    match check {
+        Ok(Preflight::Eligible) => {}
+        Ok(Preflight::IdentityChanged) => {
+            // A refused stale address is not exclusion or acknowledgement. Keep
+            // pending work so the next locked snapshot can transfer it by terminal
+            // identity, even if its pane.moved hook is delayed or never arrives.
+            return Ok(JumpOutcome::Empty);
+        }
+        Ok(Preflight::Ineligible) => {
+            // Only a fresh observation of this same terminal in an excluded or
+            // unresolved workspace establishes policy suppression.
+            store.update(|state| {
+                state.invalidate_target(&selected.terminal_id);
+                Ok(())
+            })?;
+            return Ok(JumpOutcome::Empty);
+        }
+        Err(error) => {
+            store.update(|state| {
+                state.policy_unavailable();
+                Ok(())
+            })?;
+            return Err(error);
+        }
+    }
+    let focused = herdr.focus_agent(&selected.pane_id)?;
+    mark_focus_seen(store, focused, selected)?;
+    Ok(JumpOutcome::Focused(selected.pane_id.clone()))
 }
 
 /// Status sequences are supplied by one Herdr server across all workspaces.
@@ -174,29 +288,11 @@ pub fn jump_unread(
     current_pane: Option<&str>,
 ) -> Result<JumpOutcome> {
     let selected = store.update(|state| {
-        // Serialize the API read with hook reads and ledger writes. Otherwise
-        // a list fetched before a newer hook could roll its acknowledgement back.
-        let agents = herdr.agent_list()?;
-        let live_panes = agents
-            .iter()
-            .map(|agent| agent.pane_id.clone())
-            .collect::<BTreeSet<_>>();
-        for observation in &agents {
-            let current = is_current(observation, current_pane);
-            state.observe(observation.clone(), ObservationSource::Reconcile);
-            if current {
-                state.observe(observation.clone(), ObservationSource::Focus);
-            }
-        }
-        let missing = state
-            .entries()
-            .keys()
-            .filter(|pane_id| !live_panes.contains(*pane_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        for pane_id in missing {
-            state.remove_pane(&pane_id);
-        }
+        let agents = match eligibility::reconcile(herdr, state) {
+            Ok(agents) => agents,
+            Err(error) => return Ok(Err(error)),
+        };
+        observe_navigation(state, &agents, current_pane);
         // Retain the calling pane as a cursor even after its completion was
         // acknowledged. Removing it would restart at newest on the next press,
         // repeating a newer blocker before visiting the next older request.
@@ -210,36 +306,37 @@ pub fn jump_unread(
             .collect::<Vec<_>>();
         sort_by_activity(&mut candidates);
         if candidates.is_empty() {
-            return Ok(None);
+            return Ok(Ok(None));
         }
         let selected = &candidates[cycle_index(&candidates, current_pane, Direction::Forward)];
         // A single blocker already on screen is not another destination.
-        Ok((!is_current(selected, current_pane)).then(|| selected.clone()))
-    })?;
+        Ok(Ok(
+            (!is_current(selected, current_pane)).then(|| selected.clone())
+        ))
+    })??;
 
     let Some(selected) = selected else {
         herdr.notify("No other unread or blocked agents", None)?;
         return Ok(JumpOutcome::Empty);
     };
 
-    let focused = herdr.focus_agent(&selected.pane_id)?;
-    mark_focus_seen(store, focused, &selected)?;
-    Ok(JumpOutcome::Focused(selected.pane_id))
+    focus_selected(herdr, store, &selected)
 }
 
 fn mark_focus_seen(
     store: &StateStore,
-    focused: crate::model::AgentObservation,
+    focused: AgentObservation,
     selected: &AgentObservation,
 ) -> Result<()> {
+    if focused.terminal_id != selected.terminal_id
+        || focused.state_change_seq != selected.state_change_seq
+    {
+        return Ok(());
+    }
+    // This adds confirmed evidence only; it does not observe status or enroll a
+    // record, so no third policy read is needed. Concurrent newer history wins.
     store.update(|state| {
-        state.observe(focused, ObservationSource::Focus);
-        if state.entries().get(&selected.pane_id).is_some_and(|entry| {
-            entry.terminal_id == selected.terminal_id
-                && entry.state_change_seq <= selected.state_change_seq
-        }) {
-            state.remove_pane(&selected.pane_id);
-        }
+        state.acknowledge_selected(selected);
         Ok(())
     })
 }
@@ -275,6 +372,20 @@ mod tests {
     }
 
     impl HerdrClient for FakeHerdr {
+        fn workspace_policy(&self) -> Result<crate::eligibility::WorkspacePolicy> {
+            let agents = self.agents.clone();
+            let mut ids: std::collections::BTreeSet<_> =
+                agents.iter().map(|a| a.workspace_id.clone()).collect();
+            ids.extend(["w1", "w2", "w3", "w4", "w5", "w9"].map(str::to_string));
+            crate::eligibility::WorkspacePolicy::from_reply(
+                &serde_json::to_vec(&serde_json::json!({
+                    "ok":true,"version":1,"herdr_socket":"/test.sock","excluded_labels":[],
+                    "workspace_ids":ids,"excluded_workspace_ids":[],"show_excluded":false
+                }))?,
+                "/test.sock",
+            )
+        }
+
         fn agent_get(&self, pane_id: &str) -> Result<Option<AgentObservation>> {
             Ok(self
                 .agents
@@ -358,7 +469,7 @@ mod tests {
             agent("w1:p4", AgentStatus::Idle, 20),
         ]);
 
-        let outcome = jump_working(&fake, None).unwrap();
+        let outcome = jump_working(&fake, &store().1, None).unwrap();
 
         assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
         assert_eq!(*fake.focused.lock().unwrap(), ["w1:p2"]);
@@ -375,12 +486,12 @@ mod tests {
         ]);
 
         assert_eq!(
-            jump_working(&fake, Some("w1:p2")).unwrap(),
+            jump_working(&fake, &store().1, Some("w1:p2")).unwrap(),
             JumpOutcome::Focused("w1:p3".to_string()),
         );
         // A supplied cursor outside the working set must not fall back to server focus.
         assert_eq!(
-            jump_working(&fake, Some("w1:p4")).unwrap(),
+            jump_working(&fake, &store().1, Some("w1:p4")).unwrap(),
             JumpOutcome::Focused("w1:p1".to_string()),
         );
     }
@@ -397,7 +508,7 @@ mod tests {
         let mut current = "outside".to_string();
         for expected in ["w3:p1", "w1:p1", "w4:p1", "w3:p1"] {
             assert_eq!(
-                jump_recent(&fake, Some(&current)).unwrap(),
+                jump_recent(&fake, &store().1, Some(&current)).unwrap(),
                 JumpOutcome::Focused(expected.to_string())
             );
             current = expected.to_string();
@@ -414,19 +525,20 @@ mod tests {
             agent("w4:p1", AgentStatus::Unknown, 6),
         ]);
         for current in &fake.agents {
-            let JumpOutcome::Focused(next) = jump_recent(&fake, Some(&current.pane_id)).unwrap()
+            let JumpOutcome::Focused(next) =
+                jump_recent(&fake, &store().1, Some(&current.pane_id)).unwrap()
             else {
                 panic!("expected a forward destination");
             };
             assert_eq!(
-                jump_recent_reverse(&fake, Some(&next)).unwrap(),
+                jump_recent_reverse(&fake, &store().1, Some(&next)).unwrap(),
                 JumpOutcome::Focused(current.pane_id.clone())
             );
         }
         let mut current = "outside".to_string();
         for expected in ["w4:p1", "w1:p1", "w3:p1", "w2:p1", "w5:p1", "w4:p1"] {
             assert_eq!(
-                jump_recent_reverse(&fake, Some(&current)).unwrap(),
+                jump_recent_reverse(&fake, &store().1, Some(&current)).unwrap(),
                 JumpOutcome::Focused(expected.to_string())
             );
             current = expected.to_string();
@@ -442,26 +554,26 @@ mod tests {
             agent("w2:p1", AgentStatus::Idle, 8),
         ]);
         assert_eq!(
-            jump_recent_reverse(&fake, Some("w2:p1")).unwrap(),
+            jump_recent_reverse(&fake, &store().1, Some("w2:p1")).unwrap(),
             JumpOutcome::Focused("w1:p1".into())
         );
         assert_eq!(
-            jump_recent_reverse(&fake, None).unwrap(),
+            jump_recent_reverse(&fake, &store().1, None).unwrap(),
             JumpOutcome::Focused("w2:p1".into())
         );
         let fake = FakeHerdr::new(vec![]);
         assert_eq!(
-            jump_recent_reverse(&fake, None).unwrap(),
+            jump_recent_reverse(&fake, &store().1, None).unwrap(),
             JumpOutcome::Empty
         );
         assert_eq!(*fake.notifications.lock().unwrap(), ["No eligible agents"]);
         let mut fake = FakeHerdr::new(vec![server_focused]);
         assert_eq!(
-            jump_recent_reverse(&fake, Some("w1:p1")).unwrap(),
+            jump_recent_reverse(&fake, &store().1, Some("w1:p1")).unwrap(),
             JumpOutcome::Focused("w1:p1".into())
         );
         fake.focus_error = true;
-        assert!(jump_recent_reverse(&fake, None).is_err());
+        assert!(jump_recent_reverse(&fake, &store().1, None).is_err());
     }
 
     #[test]
@@ -474,11 +586,11 @@ mod tests {
             agent("w2:p1", AgentStatus::Idle, 0),
         ]);
         assert_eq!(
-            jump_recent(&fake, Some("w2:p1")).unwrap(),
+            jump_recent(&fake, &store().1, Some("w2:p1")).unwrap(),
             JumpOutcome::Focused("w3:p1".to_string())
         );
         assert_eq!(
-            jump_recent(&fake, None).unwrap(),
+            jump_recent(&fake, &store().1, None).unwrap(),
             JumpOutcome::Focused("w2:p1".to_string())
         );
     }
@@ -486,15 +598,18 @@ mod tests {
     #[test]
     fn recent_jump_handles_no_agents_and_propagates_focus_failure() {
         let fake = FakeHerdr::new(vec![]);
-        assert_eq!(jump_recent(&fake, None).unwrap(), JumpOutcome::Empty);
+        assert_eq!(
+            jump_recent(&fake, &store().1, None).unwrap(),
+            JumpOutcome::Empty
+        );
         assert_eq!(*fake.notifications.lock().unwrap(), ["No eligible agents"]);
         let mut fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Unknown, 8)]);
         assert_eq!(
-            jump_recent(&fake, Some("w1:p1")).unwrap(),
+            jump_recent(&fake, &store().1, Some("w1:p1")).unwrap(),
             JumpOutcome::Focused("w1:p1".to_string())
         );
         fake.focus_error = true;
-        assert!(jump_recent(&fake, None).is_err());
+        assert!(jump_recent(&fake, &store().1, None).is_err());
     }
 
     #[test]
@@ -506,11 +621,11 @@ mod tests {
             agent("w4:p1", AgentStatus::Idle, 8),
         ]);
         assert_eq!(
-            jump_recent(&fake, Some("w1:p1")).unwrap(),
+            jump_recent(&fake, &store().1, Some("w1:p1")).unwrap(),
             JumpOutcome::Focused("w3:p1".into())
         );
         assert_eq!(
-            jump_recent_reverse(&fake, Some("w2:p1")).unwrap(),
+            jump_recent_reverse(&fake, &store().1, Some("w2:p1")).unwrap(),
             JumpOutcome::Focused("w4:p1".into())
         );
         // Finishing a turn adds it immediately; starting work removes a candidate.
@@ -518,11 +633,11 @@ mod tests {
         fake.agents[0].state_change_seq = 15;
         fake.agents[2].status = AgentStatus::Working;
         assert_eq!(
-            jump_recent(&fake, Some("w3:p1")).unwrap(),
+            jump_recent(&fake, &store().1, Some("w3:p1")).unwrap(),
             JumpOutcome::Focused("w1:p1".into())
         );
         assert_eq!(
-            jump_recent_reverse(&fake, Some("w4:p1")).unwrap(),
+            jump_recent_reverse(&fake, &store().1, Some("w4:p1")).unwrap(),
             JumpOutcome::Focused("w1:p1".into())
         );
     }
@@ -533,9 +648,12 @@ mod tests {
             agent("w1:p1", AgentStatus::Working, 14),
             agent("w2:p1", AgentStatus::Blocked, 12),
         ]);
-        assert_eq!(jump_recent(&fake, None).unwrap(), JumpOutcome::Empty);
         assert_eq!(
-            jump_recent_reverse(&fake, None).unwrap(),
+            jump_recent(&fake, &store().1, None).unwrap(),
+            JumpOutcome::Empty
+        );
+        assert_eq!(
+            jump_recent_reverse(&fake, &store().1, None).unwrap(),
             JumpOutcome::Empty
         );
         assert!(fake.focused.lock().unwrap().is_empty());
@@ -551,15 +669,15 @@ mod tests {
             agent("w5:p1", AgentStatus::Unknown, 16),
         ]);
         assert_eq!(
-            jump_working(&fake, Some("w3:p1")).unwrap(),
+            jump_working(&fake, &store().1, Some("w3:p1")).unwrap(),
             JumpOutcome::Focused("w1:p1".into())
         );
         assert_eq!(
-            jump_working(&fake, Some("w1:p1")).unwrap(),
+            jump_working(&fake, &store().1, Some("w1:p1")).unwrap(),
             JumpOutcome::Focused("w2:p1".into())
         );
         assert_eq!(
-            jump_working(&fake, Some("w2:p1")).unwrap(),
+            jump_working(&fake, &store().1, Some("w2:p1")).unwrap(),
             JumpOutcome::Focused("w1:p1".into())
         );
     }
@@ -614,7 +732,7 @@ mod tests {
             agent("w1:p2", AgentStatus::Working, 12),
         ]);
 
-        let outcome = jump_working(&fake, None).unwrap();
+        let outcome = jump_working(&fake, &store().1, None).unwrap();
 
         assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
     }
@@ -629,7 +747,7 @@ mod tests {
             agent("w1:p3", AgentStatus::Working, 8),
         ]);
 
-        let outcome = jump_working(&fake, None).unwrap();
+        let outcome = jump_working(&fake, &store().1, None).unwrap();
 
         assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
     }
@@ -641,7 +759,7 @@ mod tests {
             agent("w1:p2", AgentStatus::Done, 12),
         ]);
 
-        let outcome = jump_working(&fake, None).unwrap();
+        let outcome = jump_working(&fake, &store().1, None).unwrap();
 
         assert_eq!(outcome, JumpOutcome::Empty);
         assert!(fake.focused.lock().unwrap().is_empty());

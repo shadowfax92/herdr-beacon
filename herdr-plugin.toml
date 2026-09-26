@@ -61,3 +61,15 @@ command = ["./target/release/herdr-beacon", "event"]
 [[events]]
 on = "pane.moved"
 command = ["./target/release/herdr-beacon", "event"]
+
+[[events]]
+on = "workspace.created"
+command = ["./target/release/herdr-beacon", "event"]
+
+[[events]]
+on = "workspace.closed"
+command = ["./target/release/herdr-beacon", "event"]
+
+[[events]]
+on = "workspace.renamed"
+command = ["./target/release/herdr-beacon", "event"]

@@ -64,6 +64,9 @@ fn manifest_declares_actions_hooks_and_locked_build() {
             "pane.exited",
             "pane.agent_detected",
             "pane.moved",
+            "workspace.created",
+            "workspace.closed",
+            "workspace.renamed",
         ]
     );
 }

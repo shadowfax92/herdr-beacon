@@ -1,3 +1,4 @@
+mod support;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,9 +14,16 @@ fn fake_herdr(root: &Path) -> PathBuf {
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_HERDR_LOG"
 if [ "$1 $2" = "agent get" ]; then
-  printf '%s\n' '{"id":"fake","result":{"type":"agent_get","agent":{"terminal_id":"terminal-1","agent_status":"done","workspace_id":"w1","pane_id":"w1:p1","focused":false,"state_change_seq":8}}}'
+  case "$3" in
+    w1:p1) terminal=terminal-1; sequence=10 ;;
+    w1:p2) terminal=terminal-2; sequence=8 ;;
+    *) exit 1 ;;
+  esac
+  printf '{"result":{"agent":{"terminal_id":"%s","agent_status":"done","workspace_id":"w1","pane_id":"%s","focused":false,"state_change_seq":%s}}}\n' "$terminal" "$3" "$sequence"
 elif [ "$1 $2" = "agent list" ]; then
-  if [ "$FAKE_AGENT_LIST" = "working" ]; then
+  if [ "$HERDR_PLUGIN_EVENT" = "pane.agent_status_changed" ]; then
+    printf '%s\n' '{"result":{"agents":[{"terminal_id":"terminal-1","agent_status":"done","workspace_id":"w1","pane_id":"w1:p1","focused":false,"state_change_seq":8}]}}'
+  elif [ "$FAKE_AGENT_LIST" = "working" ]; then
     printf '%s\n' '{"id":"fake","result":{"type":"agent_list","agents":[{"terminal_id":"terminal-1","agent_status":"working","workspace_id":"w1","pane_id":"w1:p1","focused":true,"state_change_seq":10},{"terminal_id":"terminal-2","agent_status":"working","workspace_id":"w1","pane_id":"w1:p2","focused":false,"state_change_seq":8}]}}'
   elif [ "$FAKE_AGENT_LIST" = "settled" ]; then
     printf '%s\n' '{"result":{"agents":[{"terminal_id":"terminal-1","agent_status":"idle","workspace_id":"w1","pane_id":"w1:p1","focused":true,"state_change_seq":10},{"terminal_id":"terminal-2","agent_status":"done","workspace_id":"w1","pane_id":"w1:p2","focused":false,"state_change_seq":8}]}}'
@@ -55,12 +63,15 @@ fi
 #[test]
 fn event_command_consumes_the_herdr_hook_environment() {
     let temporary = tempdir().unwrap();
+    let _policy = support::PolicyServer::new(&temporary.path().join("agents"), &["w1"], &[]);
     let state_dir = temporary.path().join("state");
     let log = temporary.path().join("commands.log");
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
         .arg("event")
         .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
-        .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
+        .env("HERDR_SOCKET_PATH", "/test/host.sock")
+        .env("HERDR_AGENTS_STATE", temporary.path().join("agents"))
+        .env("HERDR_PLUGIN_STATE_DIR", temporary.path().join("state"))
         .env("HERDR_PLUGIN_EVENT", "pane.agent_status_changed")
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
@@ -84,16 +95,19 @@ fn event_command_consumes_the_herdr_hook_environment() {
             .pane_id,
         "w1:p1"
     );
-    assert_eq!(fs::read_to_string(log).unwrap(), "agent get w1:p1\n");
+    assert_eq!(fs::read_to_string(log).unwrap(), "agent list\n");
 }
 
 #[test]
 fn empty_jump_requests_an_explicitly_soundless_notification() {
     let temporary = tempdir().unwrap();
+    let _policy = support::PolicyServer::new(&temporary.path().join("agents"), &["w1"], &[]);
     let log = temporary.path().join("commands.log");
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
         .arg("jump-unread")
         .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("HERDR_SOCKET_PATH", "/test/host.sock")
+        .env("HERDR_AGENTS_STATE", temporary.path().join("agents"))
         .env("HERDR_PLUGIN_STATE_DIR", temporary.path().join("state"))
         .env("FAKE_HERDR_LOG", &log)
         .output()
@@ -113,12 +127,16 @@ fn empty_jump_requests_an_explicitly_soundless_notification() {
 #[test]
 fn working_jump_focuses_the_next_active_turn() {
     let temporary = tempdir().unwrap();
+    let _policy = support::PolicyServer::new(&temporary.path().join("agents"), &["w1"], &[]);
     let log = temporary.path().join("commands.log");
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
         .arg("jump-working")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
         .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("HERDR_SOCKET_PATH", "/test/host.sock")
+        .env("HERDR_AGENTS_STATE", temporary.path().join("agents"))
+        .env("HERDR_PLUGIN_STATE_DIR", temporary.path().join("state"))
         .env("FAKE_AGENT_LIST", "working")
         .env("FAKE_HERDR_LOG", &log)
         .output()
@@ -131,17 +149,21 @@ fn working_jump_focuses_the_next_active_turn() {
     );
     assert_eq!(
         fs::read_to_string(log).unwrap(),
-        "agent list\nagent focus w1:p2\ntab focus w1:t9\n"
+        "agent list\nagent get w1:p2\nagent focus w1:p2\ntab focus w1:t9\n"
     );
 }
 
 #[test]
 fn working_jump_uses_action_context_before_server_focus_or_inherited_pane() {
     let temporary = tempdir().unwrap();
+    let _policy = support::PolicyServer::new(&temporary.path().join("agents"), &["w1"], &[]);
     let log = temporary.path().join("commands.log");
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
         .arg("jump-working")
         .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("HERDR_SOCKET_PATH", "/test/host.sock")
+        .env("HERDR_AGENTS_STATE", temporary.path().join("agents"))
+        .env("HERDR_PLUGIN_STATE_DIR", temporary.path().join("state"))
         .env("HERDR_PANE_ID", "w1:p1")
         .env(
             "HERDR_PLUGIN_CONTEXT_JSON",
@@ -159,24 +181,27 @@ fn working_jump_uses_action_context_before_server_focus_or_inherited_pane() {
     );
     assert_eq!(
         fs::read_to_string(log).unwrap(),
-        "agent list\nagent focus w1:p1\ntab focus w1:t9\n"
+        "agent list\nagent get w1:p1\nagent focus w1:p1\ntab focus w1:t9\n"
     );
 }
 
 #[test]
-fn recent_jump_uses_action_context_and_does_not_require_queue_state() {
+fn recent_jump_uses_action_context_and_reconciles_policy_state() {
     let temporary = tempdir().unwrap();
+    let _policy = support::PolicyServer::new(&temporary.path().join("agents"), &["w1"], &[]);
     let log = temporary.path().join("commands.log");
     let state_dir = temporary.path().join("state");
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
         .arg("jump-recent")
         .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("HERDR_SOCKET_PATH", "/test/host.sock")
+        .env("HERDR_AGENTS_STATE", temporary.path().join("agents"))
+        .env("HERDR_PLUGIN_STATE_DIR", temporary.path().join("state"))
         .env("HERDR_PANE_ID", "w1:p1")
         .env(
             "HERDR_PLUGIN_CONTEXT_JSON",
             r#"{"focused_pane_id":"w1:p2"}"#,
         )
-        .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
         .env("FAKE_AGENT_LIST", "settled")
         .env("FAKE_HERDR_LOG", &log)
         .output()
@@ -188,11 +213,11 @@ fn recent_jump_uses_action_context_and_does_not_require_queue_state() {
     );
     assert_eq!(
         fs::read_to_string(log).unwrap(),
-        "agent list\nagent focus w1:p1\ntab focus w1:t9\n"
+        "agent list\nagent get w1:p1\nagent focus w1:p1\ntab focus w1:t9\n"
     );
     assert!(
-        !state_dir.exists(),
-        "Recent jumps do not need a second persisted activity history"
+        state_dir.join("state.json").exists(),
+        "Recent jumps must reconcile the shared policy and unread ledger"
     );
 }
 
@@ -205,6 +230,7 @@ fn failed_tab_navigation_is_reported_by_all_shortcuts() {
         ("jump-recent-reverse", "unread"),
     ] {
         let temporary = tempdir().unwrap();
+        let _policy = support::PolicyServer::new(&temporary.path().join("agents"), &["w1"], &[]);
         let log = temporary.path().join("commands.log");
         let state_dir = temporary.path().join("state");
         let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
@@ -213,6 +239,8 @@ fn failed_tab_navigation_is_reported_by_all_shortcuts() {
             .env("HERDR_PANE_ID", "w1:p1")
             .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
             .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+            .env("HERDR_SOCKET_PATH", "/test/host.sock")
+            .env("HERDR_AGENTS_STATE", temporary.path().join("agents"))
             .env("FAKE_AGENT_LIST", agents)
             .env("FAKE_HERDR_LOG", &log)
             .env("FAKE_TAB_FOCUS_FAIL", "1")
@@ -226,7 +254,7 @@ fn failed_tab_navigation_is_reported_by_all_shortcuts() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("tab_not_found"));
         assert_eq!(
             fs::read_to_string(log).unwrap(),
-            "agent list\nagent focus w1:p2\ntab focus w1:t9\n"
+            "agent list\nagent get w1:p2\nagent focus w1:p2\ntab focus w1:t9\n"
         );
         if action == "jump-unread" {
             // No successful navigation means the jump itself must not acknowledge it.
@@ -253,9 +281,13 @@ fn suppressed_empty_queue_notifications_are_successful_no_ops() {
     ] {
         for reason in ["rate_limited", "disabled", "busy", "no_foreground_client"] {
             let temporary = tempdir().unwrap();
+            let _policy =
+                support::PolicyServer::new(&temporary.path().join("agents"), &["w1"], &[]);
             let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
                 .arg(action)
                 .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+                .env("HERDR_SOCKET_PATH", "/test/host.sock")
+                .env("HERDR_AGENTS_STATE", temporary.path().join("agents"))
                 .env("HERDR_PLUGIN_STATE_DIR", temporary.path().join("state"))
                 .env("FAKE_HERDR_LOG", temporary.path().join("commands.log"))
                 .env("FAKE_AGENT_LIST", "empty")
@@ -275,9 +307,13 @@ fn suppressed_empty_queue_notifications_are_successful_no_ops() {
 #[test]
 fn unknown_notification_failures_are_not_silenced() {
     let temporary = tempdir().unwrap();
+    let _policy = support::PolicyServer::new(&temporary.path().join("agents"), &["w1"], &[]);
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-beacon"))
         .arg("jump-working")
         .env("HERDR_BIN_PATH", fake_herdr(temporary.path()))
+        .env("HERDR_SOCKET_PATH", "/test/host.sock")
+        .env("HERDR_AGENTS_STATE", temporary.path().join("agents"))
+        .env("HERDR_PLUGIN_STATE_DIR", temporary.path().join("state"))
         .env("FAKE_HERDR_LOG", temporary.path().join("commands.log"))
         .env("FAKE_AGENT_LIST", "empty")
         .env("FAKE_NOTIFICATION_REASON", "unexpected_failure")
