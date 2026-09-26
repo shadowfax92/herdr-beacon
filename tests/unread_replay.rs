@@ -104,6 +104,14 @@ impl Replay {
         );
         assert!(self.herdr.selected.borrow().is_empty());
     }
+
+    fn assert_target(&self) {
+        assert_eq!(
+            jump_unread(&self.herdr, &self.store, Some("w9:p9")).unwrap(),
+            JumpOutcome::Focused("w2:p2".to_string())
+        );
+        assert_eq!(*self.herdr.selected.borrow(), ["w2:p2"]);
+    }
 }
 
 #[test]
@@ -136,13 +144,13 @@ fn tests_that_moved_acknowledgement_clears_destination_pending_entry() {
 }
 
 #[test]
-fn tests_that_reconcile_repairs_preexisting_acknowledged_pending_entry() {
+fn tests_that_reconcile_preserves_ambiguous_legacy_pending_entry() {
     let replay = Replay::new();
     replay.live("w2:p2", AgentStatus::Idle, 10);
     let state_dir = replay._temporary.path().join("state");
     std::fs::create_dir(&state_dir).unwrap();
-    // Older Beacon versions could persist both records after a delayed move.
-    // Upgrading must repair that state without discarding valid idle completions.
+    // Legacy watermarks do not distinguish a view from an idle baseline or a
+    // missing old address. Keep pending work when no clearing evidence survives.
     std::fs::write(
         state_dir.join("state.json"),
         json!({
@@ -157,7 +165,34 @@ fn tests_that_reconcile_repairs_preexisting_acknowledged_pending_entry() {
     )
     .unwrap();
 
-    replay.assert_no_target();
+    replay.assert_target();
+}
+
+#[test]
+fn tests_that_destination_idle_baseline_does_not_acknowledge_a_move() {
+    let replay = Replay::new();
+    replay.live("w1:p1", AgentStatus::Working, 9);
+    replay.event("pane.agent_status_changed", json!({"pane_id": "w1:p1"}));
+    replay.live("w1:p1", AgentStatus::Idle, 10);
+    replay.event("pane.agent_status_changed", json!({"pane_id": "w1:p1"}));
+    replay.live("w2:p2", AgentStatus::Idle, 10);
+    replay.event("pane.agent_status_changed", json!({"pane_id": "w2:p2"}));
+
+    replay.moved();
+    replay.assert_target();
+}
+
+#[test]
+fn tests_that_missing_old_address_does_not_acknowledge_a_move() {
+    let replay = Replay::new();
+    replay.live("w1:p1", AgentStatus::Done, 10);
+    replay.event("pane.agent_status_changed", json!({"pane_id": "w1:p1"}));
+    replay.live("w2:p2", AgentStatus::Done, 10);
+    replay.event("pane.agent_status_changed", json!({"pane_id": "w1:p1"}));
+    replay.event("pane.agent_status_changed", json!({"pane_id": "w2:p2"}));
+
+    replay.moved();
+    replay.assert_target();
 }
 
 #[test]
@@ -171,9 +206,5 @@ fn tests_that_move_keeps_a_newer_unseen_idle_completion() {
     replay.event("pane.agent_status_changed", json!({"pane_id": "w2:p2"}));
     replay.moved();
 
-    assert_eq!(
-        jump_unread(&replay.herdr, &replay.store, Some("w9:p9")).unwrap(),
-        JumpOutcome::Focused("w2:p2".to_string())
-    );
-    assert_eq!(*replay.herdr.selected.borrow(), ["w2:p2"]);
+    replay.assert_target();
 }
