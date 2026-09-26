@@ -24,6 +24,9 @@ from pathlib import Path
 r=Path(os.environ['FIXTURE_ROOT']); args=sys.argv[1:]
 with (r/'commands').open('a') as f: f.write(' '.join(args)+'\n')
 agents=json.loads((r/'agents.json').read_text())
+if args[:2]==['agent','get'] and (r/'move-on-get.json').exists():
+    agents=json.loads((r/'move-on-get.json').read_text())
+    (r/'move-on-get.json').unlink();(r/'agents.json').write_text(json.dumps(agents))
 if args[:2]==['agent','list']: result={'agents':agents}
 elif args[:2]==['agent','get']:
     if (r/'preflight.json').exists(): agents=json.loads((r/'preflight.json').read_text())
@@ -222,7 +225,17 @@ fn tests_that_refused_preflight_keeps_other_pending_completions() {
     .unwrap();
     f.ok("jump-unread");
     assert!(f.focuses().is_empty());
+    assert!(f.state()["entries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .any(|e| e["terminal_id"] == "t-b"));
     fs::remove_file(f.root.path().join("preflight.json")).unwrap();
+    // The replacement is now canonical. Its initial idle baseline must not
+    // consume the unrelated completion waiting on b.
+    let mut replacement = agent("a", "idle", 10);
+    replacement["terminal_id"] = json!("replacement");
+    f.live(vec![replacement, agent("b", "done", 8)]);
     f.ok("jump-unread");
     assert_eq!(f.focuses(), ["p-b"]);
 }
@@ -552,4 +565,40 @@ fn tests_that_recreated_destination_does_not_inherit_another_terminal_pending_en
     f.live(vec![agent("a", "done", 10)]);
     f.ok("jump-unread");
     assert!(f.focuses().is_empty());
+}
+
+#[test]
+fn tests_that_preflight_eligible_move_retains_unviewed_completion() {
+    for deliver_hook in [false, true] {
+        let f = Fixture::new();
+        {
+            let mut p = f.policy.reply.lock().unwrap();
+            p["excluded_labels"] = json!([]);
+            p["excluded_workspace_ids"] = json!([]);
+        }
+        f.live(vec![agent("a", "working", 9)]);
+        f.ok("event");
+        f.live(vec![agent("a", "idle", 10)]);
+        f.ok("event");
+        let mut moved = agent("a", "idle", 10);
+        moved["pane_id"] = json!("moved");
+        moved["workspace_id"] = json!("d");
+        fs::write(
+            f.root.path().join("move-on-get.json"),
+            json!([moved]).to_string(),
+        )
+        .unwrap();
+        f.ok("jump-unread");
+        assert!(f.focuses().is_empty());
+        assert!(f.state()["entries"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|e| e["terminal_id"] == "t-a"));
+        if deliver_hook {
+            f.ok("event");
+        }
+        f.ok("jump-unread");
+        assert_eq!(f.focuses(), ["moved"]);
+    }
 }

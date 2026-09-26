@@ -200,21 +200,39 @@ fn focus_selected(
     store: &StateStore,
     selected: &AgentObservation,
 ) -> Result<JumpOutcome> {
+    enum Preflight {
+        Eligible,
+        Ineligible,
+        IdentityChanged,
+    }
     let check = (|| {
         let current = herdr.agent_get(&selected.pane_id)?;
         let policy = herdr.workspace_policy()?;
-        Ok(current.is_some_and(|a| {
-            a.pane_id == selected.pane_id
-                && a.terminal_id == selected.terminal_id
-                && a.workspace_id == selected.workspace_id
-                && policy.eligible(&a.workspace_id)
-        }))
+        let Some(current) = current else {
+            return Ok(Preflight::IdentityChanged);
+        };
+        if current.terminal_id != selected.terminal_id {
+            return Ok(Preflight::IdentityChanged);
+        }
+        if !policy.eligible(&current.workspace_id) {
+            return Ok(Preflight::Ineligible);
+        }
+        if current.pane_id != selected.pane_id || current.workspace_id != selected.workspace_id {
+            return Ok(Preflight::IdentityChanged);
+        }
+        Ok(Preflight::Eligible)
     })();
     match check {
-        Ok(true) => {}
-        Ok(false) => {
-            // Do not apply an out-of-lock snapshot. Only this identity becomes
-            // uncertain; the next invocation reconciles and baselines it.
+        Ok(Preflight::Eligible) => {}
+        Ok(Preflight::IdentityChanged) => {
+            // A refused stale address is not exclusion or acknowledgement. Keep
+            // pending work so the next locked snapshot can transfer it by terminal
+            // identity, even if its pane.moved hook is delayed or never arrives.
+            return Ok(JumpOutcome::Empty);
+        }
+        Ok(Preflight::Ineligible) => {
+            // Only a fresh observation of this same terminal in an excluded or
+            // unresolved workspace establishes policy suppression.
             store.update(|state| {
                 state.invalidate_target(&selected.terminal_id);
                 Ok(())
