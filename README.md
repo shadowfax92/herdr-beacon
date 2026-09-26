@@ -90,7 +90,7 @@ herdr plugin action invoke shadowfax.beacon.install-keybindings
 
 Herdr runs Beacon on agent-status, pane-focus, close, exit, detection, and move events. Beacon validates each event against the live `herdr agent` record, then stores only pane identity, attention status, and ordering metadata in its private plugin state directory.
 
-Herdr hook processes can finish out of order. Beacon orders entries with Herdr's `state_change_seq` and keeps per-terminal acknowledgement watermarks so a late completion hook cannot resurrect work that was already focused. Live API reads and state updates share a filesystem lock; state is saved in atomic private files. Existing v1 state files remain compatible.
+Herdr hook processes can finish out of order. Beacon orders entries with Herdr's `state_change_seq` and keeps per-terminal acknowledgement watermarks so a late completion hook cannot resurrect work that was already focused. A delayed pane-move hook merges acknowledgements from both pane addresses before retaining pending work; an acknowledgement covers only the same terminal's transitions at or below its sequence. Reconciliation also removes covered entries left by older versions. Live API reads and state updates share a filesystem lock; state is saved in atomic private files. Existing v1 state files remain compatible.
 
 Before every unread jump, Beacon reconciles the queue with `herdr agent list`. This recovers newer settled transitions even when a hook was missed, prunes stale entries, and rebases ordering after a Herdr server sequence reset. An unchanged `done` or `blocked` status cannot override Beacon's acknowledgement. Fresh idle/blocked snapshots are baselined rather than guessed to be unread.
 

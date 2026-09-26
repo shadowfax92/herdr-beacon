@@ -161,6 +161,11 @@ impl BeaconState {
                 self.merge_watermark(pane_id, watermark);
             }
         }
+
+        // Focus/status hooks at the destination can run before this move hook.
+        // Merge both histories first, then let acknowledgements win over any
+        // pending transition they cover, whichever address held it originally.
+        self.discard_read_entry(pane_id);
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -196,6 +201,10 @@ impl BeaconState {
     }
 
     fn record_attention(&mut self, observation: AgentObservation, reconciled: bool) {
+        // Older versions could persist a moved entry alongside its covering
+        // watermark. Repair that contradiction before returning early for a
+        // read observation, or jump selection would still see the stale entry.
+        self.discard_read_entry(&observation.pane_id);
         if let Some(watermark) = self.watermarks.get(&observation.pane_id) {
             if watermark.terminal_id == observation.terminal_id
                 && observation.state_change_seq <= watermark.state_change_seq
@@ -232,6 +241,18 @@ impl BeaconState {
             ordinal: self.next_ordinal,
         };
         self.entries.insert(observation.pane_id, entry);
+    }
+
+    fn discard_read_entry(&mut self, pane_id: &str) {
+        let acknowledged = self.entries.get(pane_id).is_some_and(|entry| {
+            self.watermarks.get(pane_id).is_some_and(|watermark| {
+                entry.terminal_id == watermark.terminal_id
+                    && entry.state_change_seq <= watermark.state_change_seq
+            })
+        });
+        if acknowledged {
+            self.entries.remove(pane_id);
+        }
     }
 
     fn clear_observation(&mut self, observation: &AgentObservation, reconciled: bool) {
