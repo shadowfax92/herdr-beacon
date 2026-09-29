@@ -8,12 +8,13 @@ use serde_json::Value;
 
 use crate::model::{AgentObservation, AgentStatus};
 
-/// Host operations and the external policy seam used by hooks and navigation.
+/// Host and policy operations at the navigation seam. The production adapter
+/// uses the Herdr CLI plus Agents control socket; tests supply a private host.
 pub trait HerdrClient {
     fn workspace_policy(&self) -> Result<crate::eligibility::WorkspacePolicy>;
     fn agent_get(&self, pane_id: &str) -> Result<Option<AgentObservation>>;
     fn agent_list(&self) -> Result<Vec<AgentObservation>>;
-    fn focus_agent(&self, pane_id: &str) -> Result<AgentObservation>;
+    fn focus_agent(&self, pane_id: &str) -> Result<()>;
     fn notify(&self, title: &str, body: Option<&str>) -> Result<()>;
     fn reload_config(&self) -> Result<()>;
 }
@@ -79,14 +80,14 @@ impl HerdrClient for Herdr {
             .collect()
     }
 
-    fn focus_agent(&self, pane_id: &str) -> Result<AgentObservation> {
+    fn focus_agent(&self, pane_id: &str) -> Result<()> {
         let invocation = self.invoke(&strings(&["agent", "focus", pane_id]))?;
         require_success(&invocation)?;
         let agent = invocation
             .value
             .pointer("/result/agent")
             .context("Herdr agent focus response omitted result.agent")?;
-        let focused = parse_agent(agent)?;
+        parse_agent(agent)?;
         let tab_id = agent
             .get("tab_id")
             .and_then(Value::as_str)
@@ -97,7 +98,7 @@ impl HerdrClient for Herdr {
         // their visible tab, even when the agent already reports focused=true.
         let tab_focus = self.invoke(&strings(&["tab", "focus", tab_id]))?;
         require_success(&tab_focus).context("failed to display the agent's tab")?;
-        Ok(focused)
+        Ok(())
     }
 
     fn notify(&self, title: &str, body: Option<&str>) -> Result<()> {

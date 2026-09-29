@@ -1,6 +1,6 @@
 //! Agents owns label resolution. This adapter validates its fresh bulk snapshot
-//! and reconciles Beacon history under the caller's state lock. Transport failure
-//! is durable uncertainty, never an empty policy or evidence that work was read.
+//! for each navigation. Transport failure stops the action; no cached policy or
+//! recovery history can override the next successful response.
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -11,9 +11,6 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use socket2::{Domain, SockAddr, Socket, Type};
 
-use crate::herdr::HerdrClient;
-use crate::model::{AgentObservation, BeaconState};
-
 const DEADLINE: Duration = Duration::from_secs(2);
 const MAX_REPLY: usize = 256 * 1024;
 
@@ -21,10 +18,8 @@ const MAX_REPLY: usize = 256 * 1024;
 /// visibility is deliberately absent from this interface: it cannot grant access.
 #[derive(Clone, Debug)]
 pub struct WorkspacePolicy {
-    pub(crate) session: String,
-    pub(crate) labels: Vec<String>,
-    pub(crate) workspaces: BTreeSet<String>,
-    pub(crate) excluded: BTreeSet<String>,
+    workspaces: BTreeSet<String>,
+    excluded: BTreeSet<String>,
 }
 impl WorkspacePolicy {
     pub fn eligible(&self, workspace: &str) -> bool {
@@ -76,8 +71,6 @@ impl WorkspacePolicy {
         }
         let _ = reply.show_excluded; // Validated type; sidebar visibility is not eligibility.
         Ok(Self {
-            session,
-            labels: reply.excluded_labels,
             workspaces,
             excluded,
         })
@@ -183,31 +176,4 @@ fn exchange(path: &Path, session: &str, deadline: Instant) -> Result<WorkspacePo
             return Ok(policy);
         }
     }
-}
-
-/// Runs only inside StateStore::update. Callers persist an inner error as a
-/// value, then return it after the update commits recovery-needed evidence.
-pub(crate) fn reconcile(
-    herdr: &impl HerdrClient,
-    state: &mut BeaconState,
-) -> Result<Vec<AgentObservation>> {
-    let result = (|| {
-        let policy = herdr.workspace_policy()?;
-        let agents = herdr.agent_list()?;
-        let mut panes = BTreeSet::new();
-        let mut terminals = BTreeSet::new();
-        if agents.iter().any(|a| {
-            a.pane_id.is_empty()
-                || a.terminal_id.is_empty()
-                || !panes.insert(&a.pane_id)
-                || !terminals.insert(&a.terminal_id)
-        }) {
-            bail!("ambiguous canonical Herdr snapshot");
-        }
-        Ok(state.apply_policy(&policy, agents))
-    })();
-    if result.is_err() {
-        state.policy_unavailable();
-    }
-    result
 }

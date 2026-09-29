@@ -1,12 +1,13 @@
+//! Stateless navigation over Herdr status and Agents workspace policy. Callers
+//! choose a mode and cursor; this module owns filtering, ordering and the fresh
+//! target check. The injected host is also the seam used by navigation tests.
 use std::collections::BTreeSet;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::Deserialize;
 
-use crate::eligibility;
 use crate::herdr::{Herdr, HerdrClient};
-use crate::model::{AgentObservation, AgentStatus, ObservationSource};
-use crate::state::StateStore;
+use crate::model::{AgentObservation, AgentStatus};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JumpOutcome {
@@ -14,49 +15,47 @@ pub enum JumpOutcome {
     Empty,
 }
 
-/// Direction within the same newest-first ring, not a second sort order. Keeping
-/// ties in one order makes forward then backward return to the same live agent.
-#[derive(Clone, Copy)]
-enum Direction {
-    Forward,
-    Backward,
+/// The four shortcut policies share one host query and selection flow. Herdr
+/// owns what is unread; modes only select from its current lifecycle labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationMode {
+    Unread,
+    Working,
+    Recent,
+    RecentReverse,
 }
 
-pub fn jump_from_environment() -> Result<JumpOutcome> {
-    let store = StateStore::from_environment()?;
-    let pane = invocation_pane();
-    jump_unread(&Herdr::from_environment(), &store, pane.as_deref())
+impl NavigationMode {
+    fn includes(self, status: AgentStatus) -> bool {
+        match self {
+            Self::Unread => matches!(status, AgentStatus::Done | AgentStatus::Blocked),
+            Self::Working => matches!(status, AgentStatus::Working | AgentStatus::Blocked),
+            Self::Recent | Self::RecentReverse => {
+                matches!(
+                    status,
+                    AgentStatus::Idle | AgentStatus::Done | AgentStatus::Unknown
+                )
+            }
+        }
+    }
+
+    fn empty_message(self) -> &'static str {
+        match self {
+            Self::Unread => "No other unread or blocked agents",
+            Self::Working => "No working or blocked agents",
+            Self::Recent | Self::RecentReverse => "No eligible agents",
+        }
+    }
 }
 
-pub fn jump_working_from_environment() -> Result<JumpOutcome> {
-    let pane = invocation_pane();
-    jump_working(
+pub fn navigate_from_environment(mode: NavigationMode) -> Result<JumpOutcome> {
+    navigate(
         &Herdr::from_environment(),
-        &StateStore::from_environment()?,
-        pane.as_deref(),
+        mode,
+        invocation_pane().as_deref(),
     )
 }
 
-pub fn jump_recent_from_environment() -> Result<JumpOutcome> {
-    let pane = invocation_pane();
-    jump_recent(
-        &Herdr::from_environment(),
-        &StateStore::from_environment()?,
-        pane.as_deref(),
-    )
-}
-
-pub fn jump_recent_reverse_from_environment() -> Result<JumpOutcome> {
-    let pane = invocation_pane();
-    jump_recent_reverse(
-        &Herdr::from_environment(),
-        &StateStore::from_environment()?,
-        pane.as_deref(),
-    )
-}
-
-/// Only action entrypoints read this context. A hook's identically named pane
-/// field identifies the event target, not the user's current navigation cursor.
 fn invocation_pane() -> Option<String> {
     #[derive(Deserialize)]
     struct Context {
@@ -74,817 +73,92 @@ fn invocation_pane() -> Option<String> {
         })
 }
 
-fn is_current(agent: &crate::model::AgentObservation, current_pane: Option<&str>) -> bool {
-    // Preserve standalone CLI behavior when there is no invoking pane context.
+fn is_current(agent: &AgentObservation, current_pane: Option<&str>) -> bool {
+    // The invoking client's cursor wins over server focus, which may belong to
+    // another attached client. Standalone commands fall back to server focus.
     current_pane.map_or(agent.focused, |pane| agent.pane_id == pane)
 }
 
-/// All navigation modes reconcile policy/history, even those selecting solely
-/// by live status. This prevents excluded turns resurfacing on a later Alt-U.
-pub fn jump_working(
+/// Read fresh host truth on every press. No hook delivery, local state directory,
+/// or prior navigation is required. Policy/host errors propagate without focus.
+pub fn navigate(
     herdr: &impl HerdrClient,
-    store: &StateStore,
+    mode: NavigationMode,
     current_pane: Option<&str>,
 ) -> Result<JumpOutcome> {
-    let agents = reconcile_navigation(herdr, store, current_pane)?;
-    jump_in_activity_order(
-        herdr,
-        store,
-        agents.into_iter().filter(is_active_turn).collect(),
-        current_pane,
-        "No working or blocked agents",
-        Direction::Forward,
-    )
-}
-
-fn is_active_turn(agent: &AgentObservation) -> bool {
-    matches!(agent.status, AgentStatus::Working | AgentStatus::Blocked)
-}
-
-pub fn jump_recent(
-    herdr: &impl HerdrClient,
-    store: &StateStore,
-    current_pane: Option<&str>,
-) -> Result<JumpOutcome> {
-    jump_recent_in_direction(herdr, store, current_pane, Direction::Forward)
-}
-
-/// The same eligible ring in reverse, with stable ties and wraparound.
-pub fn jump_recent_reverse(
-    herdr: &impl HerdrClient,
-    store: &StateStore,
-    current_pane: Option<&str>,
-) -> Result<JumpOutcome> {
-    jump_recent_in_direction(herdr, store, current_pane, Direction::Backward)
-}
-
-fn jump_recent_in_direction(
-    herdr: &impl HerdrClient,
-    store: &StateStore,
-    current_pane: Option<&str>,
-    direction: Direction,
-) -> Result<JumpOutcome> {
-    let agents = reconcile_navigation(herdr, store, current_pane)?;
-    jump_in_activity_order(
-        herdr,
-        store,
-        agents.into_iter().filter(|a| !is_active_turn(a)).collect(),
-        current_pane,
-        "No eligible agents",
-        direction,
-    )
-}
-
-fn reconcile_navigation(
-    herdr: &impl HerdrClient,
-    store: &StateStore,
-    current_pane: Option<&str>,
-) -> Result<Vec<AgentObservation>> {
-    store.update(|state| {
-        let agents = match eligibility::reconcile(herdr, state) {
-            Ok(agents) => agents,
-            Err(error) => return Ok(Err(error)),
-        };
-        observe_navigation(state, &agents, current_pane);
-        Ok(Ok(agents))
-    })?
-}
-
-fn observe_navigation(
-    state: &mut crate::model::BeaconState,
-    agents: &[AgentObservation],
-    current_pane: Option<&str>,
-) {
-    let live: BTreeSet<_> = agents.iter().map(|a| &a.pane_id).collect();
-    for agent in agents {
-        state.observe(agent.clone(), ObservationSource::Reconcile);
-        if is_current(agent, current_pane) {
-            state.observe(agent.clone(), ObservationSource::Focus);
-        }
+    let policy = herdr.workspace_policy()?;
+    let agents = herdr.agent_list()?;
+    let mut panes = BTreeSet::new();
+    let mut terminals = BTreeSet::new();
+    if agents.iter().any(|agent| {
+        agent.pane_id.is_empty()
+            || agent.terminal_id.is_empty()
+            || !panes.insert(&agent.pane_id)
+            || !terminals.insert(&agent.terminal_id)
+    }) {
+        bail!("ambiguous canonical Herdr snapshot");
     }
-    let missing: Vec<_> = state
-        .entries()
-        .keys()
-        .filter(|p| !live.contains(p))
-        .cloned()
+    let mut candidates: Vec<_> = agents
+        .into_iter()
+        .filter(|agent| {
+            policy.eligible(&agent.workspace_id)
+                && (mode.includes(agent.status)
+                    // A read completion changes to idle. Keep the invoking pane
+                    // only as a cursor so Alt-u continues toward older requests
+                    // instead of repeatedly starting at the newest blocker.
+                    || (mode == NavigationMode::Unread && is_current(agent, current_pane)))
+        })
         .collect();
-    for pane in missing {
-        state.remove_pane(&pane);
-    }
-}
-
-fn jump_in_activity_order(
-    herdr: &impl HerdrClient,
-    store: &StateStore,
-    mut agents: Vec<AgentObservation>,
-    current_pane: Option<&str>,
-    empty_message: &str,
-    direction: Direction,
-) -> Result<JumpOutcome> {
-    sort_by_activity(&mut agents);
-    if agents.is_empty() {
-        herdr.notify(empty_message, None)?;
-        return Ok(JumpOutcome::Empty);
-    }
-    focus_selected(
-        herdr,
-        store,
-        &agents[cycle_index(&agents, current_pane, direction)],
-    )
-}
-
-/// This constant-work preflight runs outside the ledger lock. Herdr has no
-/// conditional focus transaction: a move after these reads remains a narrow race.
-fn focus_selected(
-    herdr: &impl HerdrClient,
-    store: &StateStore,
-    selected: &AgentObservation,
-) -> Result<JumpOutcome> {
-    enum Preflight {
-        Eligible,
-        Ineligible,
-        IdentityChanged,
-    }
-    let check = (|| {
-        let current = herdr.agent_get(&selected.pane_id)?;
-        let policy = herdr.workspace_policy()?;
-        let Some(current) = current else {
-            return Ok(Preflight::IdentityChanged);
-        };
-        if current.terminal_id != selected.terminal_id {
-            return Ok(Preflight::IdentityChanged);
-        }
-        if !policy.eligible(&current.workspace_id) {
-            return Ok(Preflight::Ineligible);
-        }
-        if current.pane_id != selected.pane_id || current.workspace_id != selected.workspace_id {
-            return Ok(Preflight::IdentityChanged);
-        }
-        Ok(Preflight::Eligible)
-    })();
-    match check {
-        Ok(Preflight::Eligible) => {}
-        Ok(Preflight::IdentityChanged) => {
-            // A refused stale address is not exclusion or acknowledgement. Keep
-            // pending work so the next locked snapshot can transfer it by terminal
-            // identity, even if its pane.moved hook is delayed or never arrives.
-            return Ok(JumpOutcome::Empty);
-        }
-        Ok(Preflight::Ineligible) => {
-            // Only a fresh observation of this same terminal in an excluded or
-            // unresolved workspace establishes policy suppression.
-            store.update(|state| {
-                state.invalidate_target(&selected.terminal_id);
-                Ok(())
-            })?;
-            return Ok(JumpOutcome::Empty);
-        }
-        Err(error) => {
-            store.update(|state| {
-                state.policy_unavailable();
-                Ok(())
-            })?;
-            return Err(error);
-        }
-    }
-    let focused = herdr.focus_agent(&selected.pane_id)?;
-    mark_focus_seen(store, focused, selected)?;
-    Ok(JumpOutcome::Focused(selected.pane_id.clone()))
-}
-
-/// Status sequences are supplied by one Herdr server across all workspaces.
-/// Pane IDs break ties deterministically, including older servers with no sequence.
-fn sort_by_activity(agents: &mut [AgentObservation]) {
-    agents.sort_by(|left, right| {
+    candidates.sort_by(|left, right| {
         right
             .state_change_seq
             .cmp(&left.state_change_seq)
             .then_with(|| left.pane_id.cmp(&right.pane_id))
     });
-}
-
-fn cycle_index(
-    agents: &[AgentObservation],
-    current_pane: Option<&str>,
-    direction: Direction,
-) -> usize {
-    let current = agents
+    if candidates.is_empty() {
+        herdr.notify(mode.empty_message(), None)?;
+        return Ok(JumpOutcome::Empty);
+    }
+    let current = candidates
         .iter()
         .position(|agent| is_current(agent, current_pane));
-    match (direction, current) {
-        (Direction::Forward, Some(index)) => (index + 1) % agents.len(),
-        (Direction::Forward, None) => 0,
-        (Direction::Backward, Some(0) | None) => agents.len() - 1,
-        (Direction::Backward, Some(index)) => index - 1,
+    // Reverse traverses the same ring, including pane-ID ties, so forward and
+    // reverse undo each other when the host snapshot has not changed.
+    let index = match (mode, current) {
+        (NavigationMode::RecentReverse, Some(0) | None) => candidates.len() - 1,
+        (NavigationMode::RecentReverse, Some(index)) => index - 1,
+        (_, Some(index)) => (index + 1) % candidates.len(),
+        (_, None) => 0,
+    };
+    let selected = &candidates[index];
+    if mode == NavigationMode::Unread && is_current(selected, current_pane) {
+        herdr.notify(mode.empty_message(), None)?;
+        return Ok(JumpOutcome::Empty);
     }
+    focus_selected(herdr, mode, selected)
 }
 
-/// Unread completions are consumed once; blocked requests remain navigable until
-/// resolved. Keep these concepts separate so visiting a blocker cannot recreate
-/// an already acknowledged completion in the persisted unread ledger.
-pub fn jump_unread(
+fn focus_selected(
     herdr: &impl HerdrClient,
-    store: &StateStore,
-    current_pane: Option<&str>,
+    mode: NavigationMode,
+    selected: &AgentObservation,
 ) -> Result<JumpOutcome> {
-    let selected = store.update(|state| {
-        let agents = match eligibility::reconcile(herdr, state) {
-            Ok(agents) => agents,
-            Err(error) => return Ok(Err(error)),
-        };
-        observe_navigation(state, &agents, current_pane);
-        // Retain the calling pane as a cursor even after its completion was
-        // acknowledged. Removing it would restart at newest on the next press,
-        // repeating a newer blocker before visiting the next older request.
-        let mut candidates = agents
-            .into_iter()
-            .filter(|agent| {
-                agent.status == AgentStatus::Blocked
-                    || state.entries().contains_key(&agent.pane_id)
-                    || is_current(agent, current_pane)
-            })
-            .collect::<Vec<_>>();
-        sort_by_activity(&mut candidates);
-        if candidates.is_empty() {
-            return Ok(Ok(None));
-        }
-        let selected = &candidates[cycle_index(&candidates, current_pane, Direction::Forward)];
-        // A single blocker already on screen is not another destination.
-        Ok(Ok(
-            (!is_current(selected, current_pane)).then(|| selected.clone())
-        ))
-    })??;
-
-    let Some(selected) = selected else {
-        herdr.notify("No other unread or blocked agents", None)?;
+    // Selection and focus are separate host requests. Recheck identity, policy
+    // and mode membership so a moved, replaced, read or newly working target is
+    // refused. Herdr has no conditional focus operation, so the final gap remains.
+    let current = herdr.agent_get(&selected.pane_id)?;
+    let policy = herdr.workspace_policy()?;
+    let Some(current) = current else {
         return Ok(JumpOutcome::Empty);
     };
-
-    focus_selected(herdr, store, &selected)
-}
-
-fn mark_focus_seen(
-    store: &StateStore,
-    focused: AgentObservation,
-    selected: &AgentObservation,
-) -> Result<()> {
-    if focused.terminal_id != selected.terminal_id
-        || focused.state_change_seq != selected.state_change_seq
+    if current.terminal_id != selected.terminal_id
+        || current.pane_id != selected.pane_id
+        || current.workspace_id != selected.workspace_id
+        || !policy.eligible(&current.workspace_id)
+        || !mode.includes(current.status)
     {
-        return Ok(());
+        return Ok(JumpOutcome::Empty);
     }
-    // This adds confirmed evidence only; it does not observe status or enroll a
-    // record, so no third policy read is needed. Concurrent newer history wins.
-    store.update(|state| {
-        state.acknowledge_selected(selected);
-        Ok(())
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use anyhow::{bail, Result};
-    use tempfile::tempdir;
-
-    use super::*;
-    use crate::herdr::HerdrClient;
-    use crate::model::{AgentObservation, AgentStatus, ObservationSource};
-    use crate::state::StateStore;
-
-    struct FakeHerdr {
-        agents: Vec<AgentObservation>,
-        focus_error: bool,
-        focused: Mutex<Vec<String>>,
-        notifications: Mutex<Vec<String>>,
-    }
-
-    impl FakeHerdr {
-        fn new(agents: Vec<AgentObservation>) -> Self {
-            Self {
-                agents,
-                focus_error: false,
-                focused: Mutex::new(Vec::new()),
-                notifications: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl HerdrClient for FakeHerdr {
-        fn workspace_policy(&self) -> Result<crate::eligibility::WorkspacePolicy> {
-            let agents = self.agents.clone();
-            let mut ids: std::collections::BTreeSet<_> =
-                agents.iter().map(|a| a.workspace_id.clone()).collect();
-            ids.extend(["w1", "w2", "w3", "w4", "w5", "w9"].map(str::to_string));
-            crate::eligibility::WorkspacePolicy::from_reply(
-                &serde_json::to_vec(&serde_json::json!({
-                    "ok":true,"version":1,"herdr_socket":"/test.sock","excluded_labels":[],
-                    "workspace_ids":ids,"excluded_workspace_ids":[],"show_excluded":false
-                }))?,
-                "/test.sock",
-            )
-        }
-
-        fn agent_get(&self, pane_id: &str) -> Result<Option<AgentObservation>> {
-            Ok(self
-                .agents
-                .iter()
-                .find(|agent| agent.pane_id == pane_id)
-                .cloned())
-        }
-
-        fn agent_list(&self) -> Result<Vec<AgentObservation>> {
-            Ok(self.agents.clone())
-        }
-
-        fn focus_agent(&self, pane_id: &str) -> Result<AgentObservation> {
-            if self.focus_error {
-                bail!("focus failed");
-            }
-            self.focused.lock().unwrap().push(pane_id.to_string());
-            let mut agent = self
-                .agents
-                .iter()
-                .find(|agent| agent.pane_id == pane_id)
-                .cloned()
-                .unwrap();
-            agent.focused = true;
-            agent.status = AgentStatus::Idle;
-            Ok(agent)
-        }
-
-        fn notify(&self, title: &str, _body: Option<&str>) -> Result<()> {
-            self.notifications.lock().unwrap().push(title.to_string());
-            Ok(())
-        }
-
-        fn reload_config(&self) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    fn agent(pane: &str, status: AgentStatus, sequence: u64) -> AgentObservation {
-        AgentObservation {
-            pane_id: pane.to_string(),
-            terminal_id: format!("terminal-{pane}"),
-            workspace_id: pane.split(':').next().unwrap().to_string(),
-            status,
-            focused: false,
-            state_change_seq: sequence,
-        }
-    }
-
-    fn store() -> (tempfile::TempDir, StateStore) {
-        let temporary = tempdir().unwrap();
-        let store = StateStore::new(temporary.path().join("state"));
-        (temporary, store)
-    }
-
-    #[test]
-    fn jump_recovers_done_agents_and_focuses_the_newest() {
-        let (_temporary, store) = store();
-        let fake = FakeHerdr::new(vec![
-            agent("w1:p1", AgentStatus::Done, 4),
-            agent("w2:p1", AgentStatus::Done, 9),
-        ]);
-
-        let outcome = jump_unread(&fake, &store, None).unwrap();
-
-        assert_eq!(outcome, JumpOutcome::Focused("w2:p1".to_string()));
-        assert_eq!(*fake.focused.lock().unwrap(), ["w2:p1"]);
-        let state = store.read().unwrap();
-        assert_eq!(state.entries().len(), 1);
-        assert_eq!(state.newest().unwrap().pane_id, "w1:p1");
-    }
-
-    #[test]
-    fn working_jump_advances_from_the_focused_agent_in_recency_order() {
-        let mut newest = agent("w1:p1", AgentStatus::Working, 12);
-        newest.focused = true;
-        let fake = FakeHerdr::new(vec![
-            agent("w1:p3", AgentStatus::Working, 4),
-            newest,
-            agent("w1:p2", AgentStatus::Working, 8),
-            agent("w1:p4", AgentStatus::Idle, 20),
-        ]);
-
-        let outcome = jump_working(&fake, &store().1, None).unwrap();
-
-        assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
-        assert_eq!(*fake.focused.lock().unwrap(), ["w1:p2"]);
-    }
-
-    #[test]
-    fn working_jump_uses_invoking_pane_instead_of_server_focus() {
-        let mut server_focused = agent("w1:p1", AgentStatus::Working, 12);
-        server_focused.focused = true;
-        let fake = FakeHerdr::new(vec![
-            server_focused,
-            agent("w1:p2", AgentStatus::Working, 8),
-            agent("w1:p3", AgentStatus::Working, 4),
-        ]);
-
-        assert_eq!(
-            jump_working(&fake, &store().1, Some("w1:p2")).unwrap(),
-            JumpOutcome::Focused("w1:p3".to_string()),
-        );
-        // A supplied cursor outside the working set must not fall back to server focus.
-        assert_eq!(
-            jump_working(&fake, &store().1, Some("w1:p4")).unwrap(),
-            JumpOutcome::Focused("w1:p1".to_string()),
-        );
-    }
-
-    #[test]
-    fn recent_jump_skips_working_and_blocked_but_keeps_unread_completions() {
-        let fake = FakeHerdr::new(vec![
-            agent("w1:p1", AgentStatus::Idle, 8),
-            agent("w2:p1", AgentStatus::Blocked, 12),
-            agent("w3:p1", AgentStatus::Done, 10),
-            agent("w4:p1", AgentStatus::Unknown, 6),
-            agent("w5:p1", AgentStatus::Working, 14),
-        ]);
-        let mut current = "outside".to_string();
-        for expected in ["w3:p1", "w1:p1", "w4:p1", "w3:p1"] {
-            assert_eq!(
-                jump_recent(&fake, &store().1, Some(&current)).unwrap(),
-                JumpOutcome::Focused(expected.to_string())
-            );
-            current = expected.to_string();
-        }
-    }
-
-    #[test]
-    fn reverse_recent_jump_inverts_forward_at_every_position_including_ties_and_wrap() {
-        let fake = FakeHerdr::new(vec![
-            agent("w3:p1", AgentStatus::Done, 10),
-            agent("w1:p1", AgentStatus::Idle, 8),
-            agent("w2:p1", AgentStatus::Idle, 10),
-            agent("w5:p1", AgentStatus::Done, 14),
-            agent("w4:p1", AgentStatus::Unknown, 6),
-        ]);
-        for current in &fake.agents {
-            let JumpOutcome::Focused(next) =
-                jump_recent(&fake, &store().1, Some(&current.pane_id)).unwrap()
-            else {
-                panic!("expected a forward destination");
-            };
-            assert_eq!(
-                jump_recent_reverse(&fake, &store().1, Some(&next)).unwrap(),
-                JumpOutcome::Focused(current.pane_id.clone())
-            );
-        }
-        let mut current = "outside".to_string();
-        for expected in ["w4:p1", "w1:p1", "w3:p1", "w2:p1", "w5:p1", "w4:p1"] {
-            assert_eq!(
-                jump_recent_reverse(&fake, &store().1, Some(&current)).unwrap(),
-                JumpOutcome::Focused(expected.to_string())
-            );
-            current = expected.to_string();
-        }
-    }
-
-    #[test]
-    fn reverse_recent_jump_respects_invoking_pane_and_handles_empty_single_and_errors() {
-        let mut server_focused = agent("w1:p1", AgentStatus::Done, 12);
-        server_focused.focused = true;
-        let fake = FakeHerdr::new(vec![
-            server_focused.clone(),
-            agent("w2:p1", AgentStatus::Idle, 8),
-        ]);
-        assert_eq!(
-            jump_recent_reverse(&fake, &store().1, Some("w2:p1")).unwrap(),
-            JumpOutcome::Focused("w1:p1".into())
-        );
-        assert_eq!(
-            jump_recent_reverse(&fake, &store().1, None).unwrap(),
-            JumpOutcome::Focused("w2:p1".into())
-        );
-        let fake = FakeHerdr::new(vec![]);
-        assert_eq!(
-            jump_recent_reverse(&fake, &store().1, None).unwrap(),
-            JumpOutcome::Empty
-        );
-        assert_eq!(*fake.notifications.lock().unwrap(), ["No eligible agents"]);
-        let mut fake = FakeHerdr::new(vec![server_focused]);
-        assert_eq!(
-            jump_recent_reverse(&fake, &store().1, Some("w1:p1")).unwrap(),
-            JumpOutcome::Focused("w1:p1".into())
-        );
-        fake.focus_error = true;
-        assert!(jump_recent_reverse(&fake, &store().1, None).is_err());
-    }
-
-    #[test]
-    fn recent_jump_uses_invoking_pane_with_stable_ties() {
-        let mut server_focused = agent("w1:p1", AgentStatus::Done, 0);
-        server_focused.focused = true;
-        let fake = FakeHerdr::new(vec![
-            agent("w3:p1", AgentStatus::Idle, 0),
-            server_focused,
-            agent("w2:p1", AgentStatus::Idle, 0),
-        ]);
-        assert_eq!(
-            jump_recent(&fake, &store().1, Some("w2:p1")).unwrap(),
-            JumpOutcome::Focused("w3:p1".to_string())
-        );
-        assert_eq!(
-            jump_recent(&fake, &store().1, None).unwrap(),
-            JumpOutcome::Focused("w2:p1".to_string())
-        );
-    }
-
-    #[test]
-    fn recent_jump_handles_no_agents_and_propagates_focus_failure() {
-        let fake = FakeHerdr::new(vec![]);
-        assert_eq!(
-            jump_recent(&fake, &store().1, None).unwrap(),
-            JumpOutcome::Empty
-        );
-        assert_eq!(*fake.notifications.lock().unwrap(), ["No eligible agents"]);
-        let mut fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Unknown, 8)]);
-        assert_eq!(
-            jump_recent(&fake, &store().1, Some("w1:p1")).unwrap(),
-            JumpOutcome::Focused("w1:p1".to_string())
-        );
-        fake.focus_error = true;
-        assert!(jump_recent(&fake, &store().1, None).is_err());
-    }
-
-    #[test]
-    fn recent_directions_enter_from_excluded_agents_and_refresh_membership() {
-        let mut fake = FakeHerdr::new(vec![
-            agent("w1:p1", AgentStatus::Working, 14),
-            agent("w2:p1", AgentStatus::Blocked, 12),
-            agent("w3:p1", AgentStatus::Done, 10),
-            agent("w4:p1", AgentStatus::Idle, 8),
-        ]);
-        assert_eq!(
-            jump_recent(&fake, &store().1, Some("w1:p1")).unwrap(),
-            JumpOutcome::Focused("w3:p1".into())
-        );
-        assert_eq!(
-            jump_recent_reverse(&fake, &store().1, Some("w2:p1")).unwrap(),
-            JumpOutcome::Focused("w4:p1".into())
-        );
-        // Finishing a turn adds it immediately; starting work removes a candidate.
-        fake.agents[0].status = AgentStatus::Idle;
-        fake.agents[0].state_change_seq = 15;
-        fake.agents[2].status = AgentStatus::Working;
-        assert_eq!(
-            jump_recent(&fake, &store().1, Some("w3:p1")).unwrap(),
-            JumpOutcome::Focused("w1:p1".into())
-        );
-        assert_eq!(
-            jump_recent_reverse(&fake, &store().1, Some("w4:p1")).unwrap(),
-            JumpOutcome::Focused("w1:p1".into())
-        );
-    }
-
-    #[test]
-    fn recent_directions_do_not_focus_when_all_agents_are_working_or_blocked() {
-        let fake = FakeHerdr::new(vec![
-            agent("w1:p1", AgentStatus::Working, 14),
-            agent("w2:p1", AgentStatus::Blocked, 12),
-        ]);
-        assert_eq!(
-            jump_recent(&fake, &store().1, None).unwrap(),
-            JumpOutcome::Empty
-        );
-        assert_eq!(
-            jump_recent_reverse(&fake, &store().1, None).unwrap(),
-            JumpOutcome::Empty
-        );
-        assert!(fake.focused.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn working_cycle_includes_blockers_and_excludes_finished_or_unknown_agents() {
-        let fake = FakeHerdr::new(vec![
-            agent("w1:p1", AgentStatus::Working, 14),
-            agent("w2:p1", AgentStatus::Blocked, 12),
-            agent("w3:p1", AgentStatus::Done, 20),
-            agent("w4:p1", AgentStatus::Idle, 18),
-            agent("w5:p1", AgentStatus::Unknown, 16),
-        ]);
-        assert_eq!(
-            jump_working(&fake, &store().1, Some("w3:p1")).unwrap(),
-            JumpOutcome::Focused("w1:p1".into())
-        );
-        assert_eq!(
-            jump_working(&fake, &store().1, Some("w1:p1")).unwrap(),
-            JumpOutcome::Focused("w2:p1".into())
-        );
-        assert_eq!(
-            jump_working(&fake, &store().1, Some("w2:p1")).unwrap(),
-            JumpOutcome::Focused("w1:p1".into())
-        );
-    }
-
-    #[test]
-    fn unread_jump_keeps_api_idle_completion_and_does_not_repeat_it() {
-        let (_temporary, store) = store();
-        store
-            .update(|state| {
-                state.observe(
-                    agent("w1:p1", AgentStatus::Working, 8),
-                    ObservationSource::Event,
-                );
-                Ok(())
-            })
-            .unwrap();
-        let mut idle = agent("w1:p1", AgentStatus::Idle, 9);
-        idle.focused = true;
-        let fake = FakeHerdr::new(vec![idle]);
-
-        assert_eq!(
-            jump_unread(&fake, &store, Some("w1:p2")).unwrap(),
-            JumpOutcome::Focused("w1:p1".to_string()),
-        );
-        assert_eq!(
-            jump_unread(&fake, &store, Some("w1:p2")).unwrap(),
-            JumpOutcome::Empty,
-        );
-        assert_eq!(*fake.focused.lock().unwrap(), ["w1:p1"]);
-    }
-
-    #[test]
-    fn unread_jump_acknowledges_only_the_invoking_pane() {
-        let (_temporary, store) = store();
-        let mut other_client = agent("w1:p1", AgentStatus::Done, 8);
-        other_client.focused = true;
-        let fake = FakeHerdr::new(vec![other_client, agent("w1:p2", AgentStatus::Done, 9)]);
-        assert_eq!(
-            jump_unread(&fake, &store, Some("w1:p2")).unwrap(),
-            JumpOutcome::Focused("w1:p1".to_string()),
-        );
-        assert!(store.read().unwrap().entries().is_empty());
-    }
-
-    #[test]
-    fn working_jump_starts_with_the_newest_turn_when_focus_is_elsewhere() {
-        let mut idle = agent("w1:p3", AgentStatus::Idle, 20);
-        idle.focused = true;
-        let fake = FakeHerdr::new(vec![
-            agent("w1:p1", AgentStatus::Working, 8),
-            idle,
-            agent("w1:p2", AgentStatus::Working, 12),
-        ]);
-
-        let outcome = jump_working(&fake, &store().1, None).unwrap();
-
-        assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
-    }
-
-    #[test]
-    fn working_jump_wraps_from_the_oldest_turn_to_the_newest() {
-        let mut oldest = agent("w1:p1", AgentStatus::Working, 4);
-        oldest.focused = true;
-        let fake = FakeHerdr::new(vec![
-            oldest,
-            agent("w1:p2", AgentStatus::Working, 12),
-            agent("w1:p3", AgentStatus::Working, 8),
-        ]);
-
-        let outcome = jump_working(&fake, &store().1, None).unwrap();
-
-        assert_eq!(outcome, JumpOutcome::Focused("w1:p2".to_string()));
-    }
-
-    #[test]
-    fn working_jump_reports_an_empty_queue_without_focusing() {
-        let fake = FakeHerdr::new(vec![
-            agent("w1:p1", AgentStatus::Idle, 8),
-            agent("w1:p2", AgentStatus::Done, 12),
-        ]);
-
-        let outcome = jump_working(&fake, &store().1, None).unwrap();
-
-        assert_eq!(outcome, JumpOutcome::Empty);
-        assert!(fake.focused.lock().unwrap().is_empty());
-        assert_eq!(
-            *fake.notifications.lock().unwrap(),
-            ["No working or blocked agents"]
-        );
-    }
-
-    #[test]
-    fn reconciliation_prunes_missing_focused_and_running_entries() {
-        let (_temporary, store) = store();
-        store
-            .update(|state| {
-                for observation in [
-                    agent("w1:p1", AgentStatus::Done, 2),
-                    agent("w1:p2", AgentStatus::Blocked, 3),
-                    agent("w1:p3", AgentStatus::Done, 4),
-                ] {
-                    state.observe(observation, ObservationSource::Event);
-                }
-                Ok(())
-            })
-            .unwrap();
-        let mut focused = agent("w1:p2", AgentStatus::Blocked, 3);
-        focused.focused = true;
-        let fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Working, 5), focused]);
-
-        let outcome = jump_unread(&fake, &store, None).unwrap();
-
-        assert_eq!(outcome, JumpOutcome::Empty);
-        assert!(store.read().unwrap().entries().is_empty());
-    }
-
-    #[test]
-    fn unread_jump_includes_already_blocked_agents_without_inventing_unread_state() {
-        let (_temporary, store) = store();
-        let fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Blocked, 7)]);
-
-        let outcome = jump_unread(&fake, &store, None).unwrap();
-
-        assert_eq!(outcome, JumpOutcome::Focused("w1:p1".to_string()));
-        assert!(store.read().unwrap().entries().is_empty());
-    }
-
-    #[test]
-    fn unread_jump_cycles_seen_blocked_agents_and_consumes_completions() {
-        let (_temporary, store) = store();
-        let fake = FakeHerdr::new(vec![
-            agent("w1:p1", AgentStatus::Blocked, 12),
-            agent("w2:p1", AgentStatus::Done, 10),
-            agent("w3:p1", AgentStatus::Blocked, 8),
-            agent("w4:p1", AgentStatus::Blocked, 4),
-            agent("w5:p1", AgentStatus::Idle, 20),
-        ]);
-        // Having looked at a blocked request does not resolve its need for input.
-        store
-            .update(|state| {
-                for observation in &fake.agents {
-                    if observation.status == AgentStatus::Blocked {
-                        state.observe(observation.clone(), ObservationSource::Focus);
-                    }
-                }
-                Ok(())
-            })
-            .unwrap();
-        let mut current = "w5:p1".to_string();
-        for expected in ["w1:p1", "w2:p1", "w3:p1", "w4:p1", "w1:p1", "w3:p1"] {
-            assert_eq!(
-                jump_unread(&fake, &store, Some(&current)).unwrap(),
-                JumpOutcome::Focused(expected.to_string())
-            );
-            current = expected.to_string();
-        }
-        assert!(store.read().unwrap().entries().is_empty());
-    }
-
-    #[test]
-    fn unread_jump_wraps_from_an_acknowledged_completion_without_repeating_it() {
-        let (_temporary, store) = store();
-        let mut current = agent("w1:p1", AgentStatus::Idle, 4);
-        current.focused = true;
-        let fake = FakeHerdr::new(vec![current, agent("w2:p1", AgentStatus::Blocked, 12)]);
-        assert_eq!(
-            jump_unread(&fake, &store, Some("w1:p1")).unwrap(),
-            JumpOutcome::Focused("w2:p1".to_string())
-        );
-        assert_eq!(
-            jump_unread(&fake, &store, Some("w2:p1")).unwrap(),
-            JumpOutcome::Empty
-        );
-    }
-
-    #[test]
-    fn unread_jump_drops_a_resolved_blocker() {
-        let (_temporary, store) = store();
-        let blocked = agent("w1:p1", AgentStatus::Blocked, 8);
-        store
-            .update(|state| {
-                state.observe(blocked, ObservationSource::Focus);
-                Ok(())
-            })
-            .unwrap();
-        let fake = FakeHerdr::new(vec![agent("w1:p1", AgentStatus::Working, 9)]);
-        assert_eq!(
-            jump_unread(&fake, &store, Some("w2:p1")).unwrap(),
-            JumpOutcome::Empty
-        );
-    }
-
-    #[test]
-    fn focus_failure_keeps_the_selected_entry() {
-        let (_temporary, store) = store();
-        let selected = agent("w1:p1", AgentStatus::Done, 11);
-        store
-            .update(|state| {
-                state.observe(selected.clone(), ObservationSource::Event);
-                Ok(())
-            })
-            .unwrap();
-        let mut fake = FakeHerdr::new(vec![selected]);
-        fake.focus_error = true;
-
-        assert!(jump_unread(&fake, &store, None).is_err());
-
-        assert_eq!(store.read().unwrap().newest().unwrap().pane_id, "w1:p1");
-    }
+    herdr.focus_agent(&current.pane_id)?;
+    Ok(JumpOutcome::Focused(current.pane_id))
 }

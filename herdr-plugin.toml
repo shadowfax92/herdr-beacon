@@ -37,39 +37,3 @@ id = "install-keybindings"
 title = "Install Beacon keybindings"
 description = "Bind Alt-U for unread/blocked, Alt-O for working/blocked, and Alt-' / Shift-Alt-' for other agents."
 command = ["./target/release/herdr-beacon", "install-keybindings"]
-
-[[events]]
-on = "pane.agent_status_changed"
-command = ["./target/release/herdr-beacon", "event"]
-
-[[events]]
-on = "pane.focused"
-command = ["./target/release/herdr-beacon", "event"]
-
-[[events]]
-on = "pane.closed"
-command = ["./target/release/herdr-beacon", "event"]
-
-[[events]]
-on = "pane.exited"
-command = ["./target/release/herdr-beacon", "event"]
-
-[[events]]
-on = "pane.agent_detected"
-command = ["./target/release/herdr-beacon", "event"]
-
-[[events]]
-on = "pane.moved"
-command = ["./target/release/herdr-beacon", "event"]
-
-[[events]]
-on = "workspace.created"
-command = ["./target/release/herdr-beacon", "event"]
-
-[[events]]
-on = "workspace.closed"
-command = ["./target/release/herdr-beacon", "event"]
-
-[[events]]
-on = "workspace.renamed"
-command = ["./target/release/herdr-beacon", "event"]

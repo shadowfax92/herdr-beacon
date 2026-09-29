@@ -1,5 +1,8 @@
 //! Private Agents endpoint for CLI tests. The thread owns its listener and is
 //! joined on drop so no server or state escapes a test's temporary directory.
+#[allow(dead_code)]
+pub mod cli;
+
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
