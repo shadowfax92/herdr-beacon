@@ -16,6 +16,8 @@ import re
 import select
 import shutil
 import struct
+import socket as sockets
+import threading
 import subprocess
 import sys
 import tempfile
@@ -39,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
     config = Path(root) / "config.toml"
     shutil.copyfile(Path(__file__).with_name("herdr-repro.toml"), config)
     env.update(XDG_CONFIG_HOME=root + "/config", XDG_STATE_HOME=root + "/state",
-               HERDR_CONFIG_PATH=str(config),
+               HERDR_CONFIG_PATH=str(config), HERDR_AGENTS_STATE=root + "/policy",
                TERM="xterm-256color")
 
     def cli(*args):
@@ -70,6 +72,9 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
                     os.write(fd, b"\x1b[1;1R")
         return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", output).decode("utf-8", errors="replace")
 
+    policy_stop = threading.Event()
+    policy_thread = None
+    policy_listener = None
     try:
         frame(2)
         origin = cli("pane", "list")["result"]["panes"][0]["pane_id"]
@@ -77,6 +82,32 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
         pane = created["root_pane"]["pane_id"]
         socket = cli("status", "--json")["server"]["socket"]
         assert socket.startswith(root + "/"), "refuse to contact a non-test socket"
+        # Only workspace eligibility is substituted. Lifecycle, focus, tab
+        # navigation and rendering all come from the owned real Herdr session.
+        Path(root, "policy").mkdir()
+        policy_listener = sockets.socket(sockets.AF_UNIX)
+        policy_listener.bind(str(Path(root, "policy/control.sock")))
+        policy_listener.listen()
+        policy_listener.settimeout(0.05)
+
+        def serve_policy():
+            while not policy_stop.is_set():
+                try:
+                    connection, _ = policy_listener.accept()
+                except TimeoutError:
+                    continue
+                with connection:
+                    connection.settimeout(3)
+                    request = json.loads(connection.makefile("rb").readline())
+                    assert request == {"cmd": "workspace_policy", "version": 1, "herdr_socket": socket}
+                    workspaces = cli("workspace", "list")["result"]["workspaces"]
+                    reply = {"ok": True, "version": 1, "herdr_socket": socket,
+                             "workspace_ids": sorted(w["workspace_id"] for w in workspaces),
+                             "excluded_labels": [], "excluded_workspace_ids": [], "show_excluded": False}
+                    connection.sendall(json.dumps(reply).encode() + b"\n")
+
+        policy_thread = threading.Thread(target=serve_policy)
+        policy_thread.start()
         plugin_env = dict(env, HERDR_BIN_PATH=herdr, HERDR_SOCKET_PATH=socket,
                           HERDR_PLUGIN_STATE_DIR=root + "/beacon", HERDR_PANE_ID=origin,
                           HERDR_PLUGIN_CONTEXT_JSON=json.dumps({"focused_pane_id": origin}))
@@ -95,12 +126,7 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
         cli("pane", "run", pane, "printf 'BEACON_CROSS_TAB_VISIBLE\\n'")
         cli("pane", "report-agent", pane, "--agent", "codex", "--state", "working", "--source", "beacon:repro")
         if action == "jump-unread":
-            # Seed a real working observation, then finish it while hidden. No
-            # production hooks or state are used to bootstrap this test queue.
-            plugin_env.update(HERDR_PLUGIN_EVENT="pane.agent_status_changed",
-                              HERDR_PLUGIN_EVENT_JSON=json.dumps({"event": "pane_agent_status_changed",
-                                  "data": {"type": "pane_agent_status_changed", "pane_id": pane}}))
-            invoke("event")
+            # Finishing while hidden makes the host report done; no Beacon hooks.
             cli("pane", "report-agent", pane, "--agent", "codex", "--state", "idle", "--source", "beacon:repro")
         if status:
             cli("pane", "report-agent", pane, "--agent", "codex", "--state", status, "--source", "beacon:repro")
@@ -140,6 +166,11 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
             print(json.dumps({"roundtrip_restored_origin": restored}))
             assert restored, "Forward must undo reverse when activity order is unchanged"
     finally:
+        policy_stop.set()
+        if policy_thread is not None:
+            policy_thread.join(timeout=10)
+        if policy_listener is not None:
+            policy_listener.close()
         # Never stop the user's server: this environment selects only our named
         # test session. Close the owned PTY even if server shutdown fails.
         try:

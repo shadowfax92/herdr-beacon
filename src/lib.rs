@@ -2,12 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod eligibility;
-pub mod event;
 pub mod herdr;
 pub mod jump;
 pub mod keybindings;
 pub mod model;
-pub mod state;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,6 +19,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    // Older hosts may still have a lifecycle hook queued during installation.
+    // Accept it without any I/O; the manifest no longer registers hooks.
+    #[command(hide = true)]
     Event,
     JumpUnread,
     JumpWorking,
@@ -32,11 +33,19 @@ enum Commands {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Event => event::handle_event_from_environment(),
-        Commands::JumpUnread => jump::jump_from_environment().map(|_| ()),
-        Commands::JumpRecentReverse => jump::jump_recent_reverse_from_environment().map(|_| ()),
-        Commands::JumpRecent => jump::jump_recent_from_environment().map(|_| ()),
-        Commands::JumpWorking => jump::jump_working_from_environment().map(|_| ()),
+        Commands::Event => Ok(()),
+        Commands::JumpUnread => {
+            jump::navigate_from_environment(jump::NavigationMode::Unread).map(|_| ())
+        }
+        Commands::JumpRecentReverse => {
+            jump::navigate_from_environment(jump::NavigationMode::RecentReverse).map(|_| ())
+        }
+        Commands::JumpRecent => {
+            jump::navigate_from_environment(jump::NavigationMode::Recent).map(|_| ())
+        }
+        Commands::JumpWorking => {
+            jump::navigate_from_environment(jump::NavigationMode::Working).map(|_| ())
+        }
         Commands::InstallKeybindings => keybindings::install_from_environment().map(|_| ()),
     }
 }

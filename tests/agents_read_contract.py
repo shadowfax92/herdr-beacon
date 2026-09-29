@@ -3,7 +3,7 @@
 
 Only the external host is fake. All sockets, config, CLI focus logs, and plugin
 state are private; the daemon child is stopped in finally. Visibility is preseeded
-fixture data, not a claim about the skeleton's unimplemented SET command.
+fixture data; the test does not exercise the visibility SET command.
 """
 import argparse
 import hashlib
@@ -149,10 +149,7 @@ def run(args):
             def live(values):
                 (root / "live.json").write_text(json.dumps(values))
 
-            def execute(mode, name, expected, success=True, extra=None, fresh=True):
-                state = root / "beacon/state.json"
-                if fresh and state.exists():
-                    state.unlink()  # Only this fixture's ledger, never owner state.
+            def execute(mode, name, expected, success=True, extra=None):
                 (root / "commands.jsonl").write_text("")
                 result = subprocess.run([str(beacon_binary), mode], env=beacon_env | (extra or {}),
                                         capture_output=True, text=True, timeout=6)
@@ -160,6 +157,7 @@ def run(args):
                 focused = [c[2] for c in commands if c[:2] == ["agent", "focus"]]
                 assert (result.returncode == 0) == success, (name, result.stderr)
                 assert focused == expected, (name, focused, expected, result.stderr)
+                assert not (root / "beacon/state.json").exists(), "Beacon wrote a runtime ledger"
                 evidence["cases"].append({"case": name, "exit": result.returncode,
                                           "focus": focused, "stderr": result.stderr.strip()})
 
@@ -179,32 +177,34 @@ def run(args):
             live([agent("d", "done", 20)])
             execute("jump-unread", "before-rename", [])
             host.workspaces[1] = {"workspace_id": "d", "label": "renamed"}
-            execute("jump-unread", "rename-out-baseline", [], fresh=False)
+            execute("jump-unread", "rename-out-current-done", ["p-d"])
             live([agent("d", "done", 22)])
-            execute("jump-unread", "rename-out-new-completion", ["p-d"], fresh=False)
+            execute("jump-unread", "rename-out-new-completion", ["p-d"])
             config.write_text('[workspace_visibility]\nexcluded_labels = ["renamed"]\n')
-            execute("jump-recent", "fresh-config-excludes-renamed", [], fresh=False)
+            execute("jump-recent", "fresh-config-excludes-renamed", [])
             config.write_text('[workspace_visibility]\nexcluded_labels = []\n')
-            execute("jump-unread", "config-removal-baseline", [], fresh=False)
+            execute("jump-unread", "config-removal-current-done", ["p-d"])
             live([agent("d", "done", 24)])
-            execute("jump-unread", "config-removal-next-completion", ["p-d"], fresh=False)
+            execute("jump-unread", "config-removal-next-completion", ["p-d"])
 
             live([agent("a", "done", 30)])
             execute("jump-unread", "wrong-session", [], success=False,
                     extra={"HERDR_SOCKET_PATH": str(root / "other.sock")})
-            execute("jump-unread", "session-recovery-baseline", [], fresh=False)
+            execute("jump-unread", "session-recovery-current-done", ["p-a"])
             host.unavailable = True
             execute("jump-unread", "host-workspaces-unavailable", [], success=False)
             host.unavailable = False
-            execute("jump-unread", "host-recovery-baseline", [], fresh=False)
+            execute("jump-unread", "host-recovery-current-done", ["p-a"])
             live([agent("a", "done", 32)])
-            execute("jump-unread", "host-recovery-next-completion", ["p-a"], fresh=False)
+            execute("jump-unread", "host-recovery-next-completion", ["p-a"])
             execute("jump-working", "missing-agents-endpoint", [], success=False,
                     extra={"HERDR_AGENTS_STATE": str(root / "missing")})
             live([agent("a", "done", 34)])
-            execute("jump-unread", "transport-recovery-baseline", [], fresh=False)
+            execute("jump-unread", "transport-recovery-current-done", ["p-a"])
             live([agent("a", "done", 36)])
-            execute("jump-unread", "transport-recovery-next-completion", ["p-a"], fresh=False)
+            execute("jump-unread", "transport-recovery-next-completion", ["p-a"])
+            live([agent("a", "idle", 38)])
+            execute("jump-unread", "api-idle-is-read", [])
             evidence["scope"] = "Actual daemon + actual Beacon CLI; private fake host and focus recorder; visibility preseed only; no live session."
         finally:
             if child is not None:

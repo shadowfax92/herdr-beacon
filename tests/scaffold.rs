@@ -11,7 +11,7 @@ fn cli_exposes_only_the_supported_commands() {
     let stdout = String::from_utf8(output.stdout).unwrap();
 
     assert!(output.status.success());
-    assert!(stdout.contains("event"));
+    assert!(!stdout.contains("event"));
     assert!(stdout.contains("jump-unread"));
     assert!(stdout.contains("jump-working"));
     assert!(stdout.contains("jump-recent"));
@@ -20,7 +20,7 @@ fn cli_exposes_only_the_supported_commands() {
 }
 
 #[test]
-fn manifest_declares_actions_hooks_and_locked_build() {
+fn manifest_declares_actions_without_lifecycle_hooks_and_locked_build() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(root.join("herdr-plugin.toml")).unwrap();
     let value = manifest.parse::<toml_edit::DocumentMut>().unwrap();
@@ -50,23 +50,5 @@ fn manifest_declares_actions_hooks_and_locked_build() {
         ]
     );
 
-    let events = value["events"].as_array_of_tables().unwrap();
-    let event_names = events
-        .iter()
-        .map(|event| event["on"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        event_names,
-        [
-            "pane.agent_status_changed",
-            "pane.focused",
-            "pane.closed",
-            "pane.exited",
-            "pane.agent_detected",
-            "pane.moved",
-            "workspace.created",
-            "workspace.closed",
-            "workspace.renamed",
-        ]
-    );
+    assert!(value.get("events").is_none());
 }
