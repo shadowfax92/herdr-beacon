@@ -99,11 +99,12 @@ with tempfile.TemporaryDirectory(prefix="bcn-nav-", dir="/tmp") as root:
                 with connection:
                     connection.settimeout(3)
                     request = json.loads(connection.makefile("rb").readline())
-                    assert request == {"cmd": "workspace_policy", "version": 1, "herdr_socket": socket}
+                    assert request == {"cmd": "workspace_policy", "version": 2, "herdr_socket": socket}
                     workspaces = cli("workspace", "list")["result"]["workspaces"]
-                    reply = {"ok": True, "version": 1, "herdr_socket": socket,
+                    reply = {"ok": True, "version": 2, "herdr_socket": socket,
                              "workspace_ids": sorted(w["workspace_id"] for w in workspaces),
-                             "excluded_labels": [], "excluded_workspace_ids": [], "show_excluded": False}
+                             "excluded_labels": [], "excluded_workspace_ids": [], "show_excluded": False,
+                             "unread": []}
                     connection.sendall(json.dumps(reply).encode() + b"\n")
 
         policy_thread = threading.Thread(target=serve_policy)

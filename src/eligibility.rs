@@ -1,7 +1,8 @@
-//! Agents owns label resolution. This adapter validates its fresh bulk snapshot
-//! for each navigation. Transport failure stops the action; no cached policy or
-//! recovery history can override the next successful response.
-use std::collections::BTreeSet;
+//! Agents owns label resolution and the sidebar's unread marks. This adapter
+//! validates its fresh bulk snapshot for each navigation. Transport failure stops
+//! the action; no cached policy or recovery history can override the next
+//! successful response.
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
@@ -11,8 +12,13 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use socket2::{Domain, SockAddr, Socket, Type};
 
+use crate::model::AgentObservation;
+
 const DEADLINE: Duration = Duration::from_secs(2);
 const MAX_REPLY: usize = 256 * 1024;
+// Version 2 replies add the sidebar's unread marks. Older Agents answers
+// unsupported_version, which stops navigation like any other policy failure.
+const VERSION: u32 = 2;
 
 /// Only a validated, session-bound snapshot may classify an observation. Display
 /// visibility is deliberately absent from this interface: it cannot grant access.
@@ -20,10 +26,20 @@ const MAX_REPLY: usize = 256 * 1024;
 pub struct WorkspacePolicy {
     workspaces: BTreeSet<String>,
     excluded: BTreeSet<String>,
+    /// Pane ID to the terminal ID observed in the same Agents frame.
+    unread: BTreeMap<String, String>,
 }
 impl WorkspacePolicy {
     pub fn eligible(&self, workspace: &str) -> bool {
         self.workspaces.contains(workspace) && !self.excluded.contains(workspace)
+    }
+
+    /// The Agents sidebar still marks this agent's completion unread (✓ •): it
+    /// finished a turn and its pane has not been focused since. Herdr may already
+    /// report it idle, because Herdr reads every pane in a visible tab, including
+    /// peers hidden behind a zoomed pane. A replaced terminal never matches.
+    pub fn marks_unread(&self, agent: &AgentObservation) -> bool {
+        self.unread.get(&agent.pane_id) == Some(&agent.terminal_id)
     }
 
     /// Real and fake adapters enter through identical wire validation.
@@ -37,6 +53,12 @@ impl WorkspacePolicy {
             workspace_ids: Vec<String>,
             excluded_workspace_ids: Vec<String>,
             show_excluded: bool,
+            unread: Vec<Unread>,
+        }
+        #[derive(Deserialize)]
+        struct Unread {
+            pane_id: String,
+            terminal_id: String,
         }
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
         if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
@@ -48,21 +70,32 @@ impl WorkspacePolicy {
         }
         let reply: Reply = serde_json::from_value(value).context("invalid Agents policy reply")?;
         let session = normalize_socket(session)?;
-        if !reply.ok || reply.version != 1 || normalize_socket(&reply.herdr_socket)? != session {
+        if !reply.ok
+            || reply.version != VERSION
+            || normalize_socket(&reply.herdr_socket)? != session
+        {
             bail!("Agents policy version/session mismatch");
         }
+        let invalid = |s: &str| s.trim().is_empty() || s.chars().any(char::is_control);
         for values in [
             &reply.excluded_labels,
             &reply.workspace_ids,
             &reply.excluded_workspace_ids,
         ] {
-            if values
-                .iter()
-                .any(|s| s.trim().is_empty() || s.chars().any(char::is_control))
-                || values.windows(2).any(|v| v[0] >= v[1])
-            {
+            if values.iter().any(|s| invalid(s)) || values.windows(2).any(|v| v[0] >= v[1]) {
                 bail!("Agents policy contains invalid or unsorted sets");
             }
+        }
+        if reply
+            .unread
+            .iter()
+            .any(|entry| invalid(&entry.pane_id) || invalid(&entry.terminal_id))
+            || reply
+                .unread
+                .windows(2)
+                .any(|pair| pair[0].pane_id >= pair[1].pane_id)
+        {
+            bail!("Agents policy contains invalid or unsorted unread completions");
         }
         let workspaces: BTreeSet<_> = reply.workspace_ids.into_iter().collect();
         let excluded: BTreeSet<_> = reply.excluded_workspace_ids.into_iter().collect();
@@ -73,6 +106,11 @@ impl WorkspacePolicy {
         Ok(Self {
             workspaces,
             excluded,
+            unread: reply
+                .unread
+                .into_iter()
+                .map(|entry| (entry.pane_id, entry.terminal_id))
+                .collect(),
         })
     }
 }
@@ -139,7 +177,7 @@ fn exchange(path: &Path, session: &str, deadline: Instant) -> Result<WorkspacePo
     let fd: std::os::fd::OwnedFd = socket.into();
     let mut stream = UnixStream::from(fd);
     let mut bytes = serde_json::to_vec(
-        &serde_json::json!({"cmd":"workspace_policy","version":1,"herdr_socket":session}),
+        &serde_json::json!({"cmd":"workspace_policy","version":VERSION,"herdr_socket":session}),
     )?;
     bytes.push(b'\n');
     let mut written = 0;

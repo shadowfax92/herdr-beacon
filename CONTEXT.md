@@ -1,9 +1,12 @@
 # Ownership and navigation
 
-Herdr owns agent identity, lifecycle, unread acknowledgement, and activity order.
-`done` means idle and unseen according to the server; `idle` is already seen.
-Individual TUI badges can differ because clients also track viewed completions.
-Beacon deliberately follows the server interface.
+Herdr owns agent identity, lifecycle, and activity order. Its `done` means idle
+and unseen, but Herdr acknowledges per tab: every pane in the active tab is
+treated as seen, including peers hidden behind a zoomed pane. Agents tracks
+completions per pane until that pane is focused and reports those unread marks
+in its v2 policy reply. Unread navigation accepts Herdr `done` or `blocked`, or
+an Agents mark for the same terminal while the agent is not working. Individual
+TUI badges can differ because clients also track viewed completions.
 
 Agents owns workspace eligibility. Its fresh, session-validated policy excludes
 workspaces from every Beacon mode, independently of sidebar visibility.

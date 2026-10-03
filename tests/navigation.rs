@@ -20,7 +20,7 @@ fn unread_follows_host_acknowledgement_without_a_state_directory() {
 }
 
 #[test]
-fn unread_ignores_idle_even_after_observing_new_work_or_unknown() {
+fn unread_ignores_unmarked_idle_even_after_observing_new_work_or_unknown() {
     for status in ["working", "unknown", "done"] {
         let f = Fixture::new();
         f.live(vec![agent("a", status, 10)]);
@@ -277,4 +277,95 @@ fn queued_legacy_hooks_are_noops_without_host_or_state_access() {
     assert!(output.status.success());
     assert!(f.commands().is_empty());
     assert!(!f.root.path().join("beacon").exists());
+}
+
+fn mark_unread(f: &Fixture, entries: &[(&str, &str)]) {
+    f.policy.reply.lock().unwrap()["unread"] = entries
+        .iter()
+        .map(|(pane, terminal)| json!({"pane_id":pane,"terminal_id":terminal}))
+        .collect();
+}
+
+#[test]
+fn unread_reaches_completions_agents_marks_after_herdr_reads_their_tab() {
+    // Herdr reads every pane in a visible tab, so a peer that finished behind a
+    // zoomed pane is already idle. Only the Agents mark says nobody saw it.
+    for status in ["idle", "unknown", "done"] {
+        let f = Fixture::new();
+        f.live(vec![agent("a", status, 10)]);
+        mark_unread(&f, &[("p-a", "t-a")]);
+        f.ok("jump-unread");
+        assert_eq!(f.focuses(), ["p-a"], "{status}");
+    }
+}
+
+#[test]
+fn agents_marks_need_the_same_terminal_and_an_agent_at_rest() {
+    for (status, terminal) in [("idle", "replaced"), ("working", "t-a")] {
+        let f = Fixture::new();
+        f.live(vec![agent("a", status, 10)]);
+        mark_unread(&f, &[("p-a", terminal)]);
+        f.ok("jump-unread");
+        assert!(f.focuses().is_empty(), "{status} {terminal}");
+    }
+}
+
+#[test]
+fn agents_marks_do_not_change_working_or_recent_modes() {
+    for (mode, status) in [("jump-working", "idle"), ("jump-recent", "working")] {
+        let f = Fixture::new();
+        f.live(vec![agent("a", status, 10)]);
+        mark_unread(&f, &[("p-a", "t-a")]);
+        f.ok(mode);
+        assert!(f.focuses().is_empty(), "{mode} {status}");
+    }
+}
+
+#[test]
+fn the_fresh_recheck_refuses_a_completion_agents_stopped_marking() {
+    let f = Fixture::new();
+    f.live(vec![agent("a", "idle", 10)]);
+    mark_unread(&f, &[("p-a", "t-a")]);
+    // The pane was focused between selection and the pre-focus policy read.
+    let mut read = f.policy.reply.lock().unwrap().clone();
+    read["unread"] = json!([]);
+    *f.policy.after_first.lock().unwrap() = Some(read);
+    f.ok("jump-unread");
+    assert!(f.focuses().is_empty());
+}
+
+#[test]
+fn unread_visits_each_marked_peer_after_herdr_reads_their_shared_tab() {
+    // Zoomed peers share one tab: focusing either makes Herdr report both
+    // idle, while Agents keeps the mark on the peer nobody has looked at.
+    let f = Fixture::new();
+    let peer = |pane: &str, seq| {
+        let mut peer = agent("a", "idle", seq);
+        peer["pane_id"] = json!(pane);
+        peer["terminal_id"] = json!(format!("t-{pane}"));
+        peer["tab_id"] = json!("tab-shared");
+        peer
+    };
+    f.live(vec![peer("older", 10), peer("newer", 20)]);
+    mark_unread(&f, &[("newer", "t-newer"), ("older", "t-older")]);
+    f.ok("jump-unread");
+    assert_eq!(f.focuses(), ["newer"]);
+    // Agents observed the focus and cleared only that pane's mark.
+    mark_unread(&f, &[("older", "t-older")]);
+    let from = |pane: &str| {
+        let output = f
+            .command("jump-unread")
+            .env("HERDR_PANE_ID", pane)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    };
+    from("newer");
+    assert_eq!(f.focuses(), ["newer", "older"]);
+    mark_unread(&f, &[]);
+    from("older");
+    assert_eq!(f.focuses(), ["newer", "older"]);
+    assert!(f
+        .commands()
+        .contains("notification show No other unread or blocked agents"));
 }
