@@ -32,6 +32,8 @@ class Host:
             {"workspace_id": "m", "label": "my-ft"},
         ]
         self.unavailable = False
+        # What the Agents daemon sees; Beacon's own host view is live.json.
+        self.agents = []
         self.done = threading.Event()
         self.listener = socket.socket(socket.AF_UNIX)
         self.listener.bind(str(root / "host.sock"))
@@ -61,7 +63,7 @@ class Host:
                 if method == "workspace.list":
                     result = {"workspaces": self.workspaces}
                 elif method == "agent.list":
-                    result = {"agents": []}
+                    result = {"agents": self.agents}
                 elif method == "pane.list":
                     result = {"panes": []}
                 elif method == "tab.list":
@@ -106,6 +108,22 @@ def agent(workspace, status, sequence):
                 tab_id=f"tab-{workspace}", agent_status=status, focused=False, state_change_seq=sequence)
 
 
+def write_config(path, labels):
+    # No idle grace: each forced Agents frame decides from exactly one snapshot.
+    path.write_text(f"idle_grace_seconds = 0\n[workspace_visibility]\nexcluded_labels = {json.dumps(labels)}\n")
+
+
+def agents_frame(root, host, agents):
+    """Show the daemon one host snapshot and wait for it to finish that frame."""
+    host.agents = agents
+    with socket.socket(socket.AF_UNIX) as stream:
+        stream.settimeout(5)
+        stream.connect(str(root / "agents/control.sock"))
+        stream.sendall(b'{"cmd":"refresh"}\n')
+        reply = json.loads(stream.makefile("rb").readline())
+    assert reply.get("ok") is True, reply
+
+
 def run(args):
     agents_binary = args.agents.resolve()
     beacon_binary = args.beacon.resolve()
@@ -124,7 +142,7 @@ def run(args):
             for name in ["agents", "config", "beacon", "xdg"]:
                 (root / name).mkdir()
             config = root / "config/config.toml"
-            config.write_text('[workspace_visibility]\nexcluded_labels = ["ft"]\n')
+            write_config(config, ["ft"])
             (root / "herdr.toml").write_text("")
             (root / "herdr").write_text(FAKE_CLI)
             (root / "herdr").chmod(0o755)
@@ -180,9 +198,9 @@ def run(args):
             execute("jump-unread", "rename-out-current-done", ["p-d"])
             live([agent("d", "done", 22)])
             execute("jump-unread", "rename-out-new-completion", ["p-d"])
-            config.write_text('[workspace_visibility]\nexcluded_labels = ["renamed"]\n')
+            write_config(config, ["renamed"])
             execute("jump-recent", "fresh-config-excludes-renamed", [])
-            config.write_text('[workspace_visibility]\nexcluded_labels = []\n')
+            write_config(config, [])
             execute("jump-unread", "config-removal-current-done", ["p-d"])
             live([agent("d", "done", 24)])
             execute("jump-unread", "config-removal-next-completion", ["p-d"])
@@ -205,7 +223,21 @@ def run(args):
             execute("jump-unread", "transport-recovery-next-completion", ["p-a"])
             live([agent("a", "idle", 38)])
             execute("jump-unread", "api-idle-is-read", [])
-            evidence["scope"] = "Actual daemon + actual Beacon CLI; private fake host and focus recorder; visibility preseed only; no live session."
+
+            # Herdr acknowledges per tab, so it reports this completion idle.
+            # The daemon saw it finish unfocused and marks it unread (policy v2).
+            agents_frame(root, host, [dict(agent("a", "working", 39), agent="codex")])
+            agents_frame(root, host, [dict(agent("a", "idle", 40), agent="codex")])
+            live([agent("a", "idle", 40)])
+            execute("jump-unread", "agents-mark-host-idle", ["p-a"])
+            live([dict(agent("a", "idle", 40), terminal_id="t-replaced")])
+            execute("jump-unread", "agents-mark-other-terminal", [])
+            live([agent("a", "working", 41)])
+            execute("jump-unread", "agents-mark-working-agent", [])
+            agents_frame(root, host, [dict(agent("a", "idle", 40), agent="codex", focused=True)])
+            live([agent("a", "idle", 40)])
+            execute("jump-unread", "agents-mark-cleared-by-focus", [])
+            evidence["scope"] = "Actual daemon + actual Beacon CLI; private fake host and focus recorder; visibility preseed only; Agents unread marks from forced daemon frames; no live session."
         finally:
             if child is not None:
                 child.terminate()

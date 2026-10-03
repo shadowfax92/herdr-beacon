@@ -136,14 +136,15 @@ fn tests_that_all_modes_exclude_resolved_ids_even_when_shown() {
             let requests = f.policy.requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
             assert!(requests.iter().all(|r| *r
-                == json!({"cmd":"workspace_policy","version":1,"herdr_socket":"/test/host.sock"})));
+                == json!({"cmd":"workspace_policy","version":2,"herdr_socket":"/test/host.sock"})));
         }
     }
 }
 #[test]
 fn tests_that_invalid_wire_replies_never_focus() {
     for (field, value) in [
-        ("version", json!(2)),
+        ("version", json!(1)),
+        ("version", json!(3)),
         ("show_excluded", json!("false")),
         ("herdr_socket", json!("/other.sock")),
         ("workspace_ids", json!([5])),
@@ -358,5 +359,47 @@ fn tests_that_explicit_agents_override_keeps_empty_and_nonempty_semantics() {
         assert!(f.focuses().is_empty());
         assert_eq!(server.requests.lock().unwrap().len(), 1);
         assert!(f.policy.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn tests_that_missing_or_invalid_unread_sets_never_focus() {
+    let entry = |pane: &str, terminal: &str| json!({"pane_id":pane,"terminal_id":terminal});
+    for unread in [
+        None,
+        Some(json!("p-a")),
+        Some(json!([{"pane_id":"p-a"}])),
+        Some(json!([entry("p-b", "t-b"), entry("p-a", "t-a")])),
+        Some(json!([entry("p-a", "t-a"), entry("p-a", "t-other")])),
+        Some(json!([entry("p-a", "")])),
+        Some(json!([entry("p-a", "t\na")])),
+    ] {
+        let f = Fixture::new();
+        f.live(vec![agent("a", "working", 8)]);
+        let mut reply = f.policy.reply.lock().unwrap();
+        match &unread {
+            None => {
+                reply.as_object_mut().unwrap().remove("unread");
+            }
+            Some(value) => reply["unread"] = value.clone(),
+        }
+        drop(reply);
+        assert!(
+            !f.run("jump-working").status.success(),
+            "accepted unread {unread:?}"
+        );
+        assert!(f.focuses().is_empty());
+    }
+}
+
+#[test]
+fn tests_that_agents_marks_in_excluded_workspaces_are_never_destinations() {
+    for shown in [false, true] {
+        let f = Fixture::new();
+        f.policy.reply.lock().unwrap()["show_excluded"] = json!(shown);
+        f.policy.reply.lock().unwrap()["unread"] = json!([{"pane_id":"p-d","terminal_id":"t-d"}]);
+        f.live(vec![agent("d", "idle", 10)]);
+        f.ok("jump-unread");
+        assert!(f.focuses().is_empty(), "shown={shown}");
     }
 }

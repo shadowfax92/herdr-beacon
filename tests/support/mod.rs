@@ -26,9 +26,9 @@ impl PolicyServer {
         std::fs::create_dir_all(root).unwrap();
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let reply = Arc::new(Mutex::new(json!({"ok":true,"version":1,
+        let reply = Arc::new(Mutex::new(json!({"ok":true,"version":2,
             "herdr_socket":"/test/host.sock", "excluded_labels": if excluded.is_empty() {vec![]} else {vec!["delegated"]},
-            "workspace_ids":workspaces,"excluded_workspace_ids":excluded,"show_excluded":false})));
+            "workspace_ids":workspaces,"excluded_workspace_ids":excluded,"show_excluded":false,"unread":[]})));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wire: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));

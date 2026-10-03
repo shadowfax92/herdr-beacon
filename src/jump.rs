@@ -1,11 +1,12 @@
-//! Stateless navigation over Herdr status and Agents workspace policy. Callers
-//! choose a mode and cursor; this module owns filtering, ordering and the fresh
-//! target check. The injected host is also the seam used by navigation tests.
+//! Stateless navigation over Herdr status and the Agents policy snapshot.
+//! Callers choose a mode and cursor; this module owns filtering, ordering and the
+//! fresh target check. The injected host is also the seam used by navigation tests.
 use std::collections::BTreeSet;
 
 use anyhow::{bail, Result};
 use serde::Deserialize;
 
+use crate::eligibility::WorkspacePolicy;
 use crate::herdr::{Herdr, HerdrClient};
 use crate::model::{AgentObservation, AgentStatus};
 
@@ -15,8 +16,9 @@ pub enum JumpOutcome {
     Empty,
 }
 
-/// The four shortcut policies share one host query and selection flow. Herdr
-/// owns what is unread; modes only select from its current lifecycle labels.
+/// The four shortcut policies share one host query and selection flow. Modes
+/// select from Herdr's current lifecycle labels; unread also accepts the Agents
+/// sidebar's per-pane marks, because Herdr acknowledges completions per tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavigationMode {
     Unread,
@@ -26,9 +28,17 @@ pub enum NavigationMode {
 }
 
 impl NavigationMode {
-    fn includes(self, status: AgentStatus) -> bool {
+    fn includes(self, agent: &AgentObservation, policy: &WorkspacePolicy) -> bool {
+        let status = agent.status;
         match self {
-            Self::Unread => matches!(status, AgentStatus::Done | AgentStatus::Blocked),
+            // Herdr marks every pane in a visible tab read, including peers
+            // hidden behind a zoomed pane, so its idle cannot prove anybody saw
+            // a completion. Agents clears its mark only when that pane is
+            // focused. A working agent has moved past the completion either way.
+            Self::Unread => {
+                matches!(status, AgentStatus::Done | AgentStatus::Blocked)
+                    || (status != AgentStatus::Working && policy.marks_unread(agent))
+            }
             Self::Working => matches!(status, AgentStatus::Working | AgentStatus::Blocked),
             Self::Recent | Self::RecentReverse => {
                 matches!(
@@ -102,7 +112,7 @@ pub fn navigate(
         .into_iter()
         .filter(|agent| {
             policy.eligible(&agent.workspace_id)
-                && (mode.includes(agent.status)
+                && (mode.includes(agent, &policy)
                     // A read completion changes to idle. Keep the invoking pane
                     // only as a cursor so Alt-u continues toward older requests
                     // instead of repeatedly starting at the newest blocker.
@@ -155,7 +165,7 @@ fn focus_selected(
         || current.pane_id != selected.pane_id
         || current.workspace_id != selected.workspace_id
         || !policy.eligible(&current.workspace_id)
-        || !mode.includes(current.status)
+        || !mode.includes(&current, &policy)
     {
         return Ok(JumpOutcome::Empty);
     }
