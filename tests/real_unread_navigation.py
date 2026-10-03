@@ -161,6 +161,11 @@ def run(scenario):
                 assert alt_u(origin) == newer, "first press should take the newest completion"
                 cursor = newer
             host = entry(target)["agent_status"]
+            # The acknowledgement scenarios only exercise Agents marks while
+            # Herdr already reports the target read. If a Herdr upgrade stops
+            # acknowledging per tab, fail loudly instead of passing on `done`.
+            expected = "done" if scenario == "background-tab" else "idle"
+            assert host == expected, f"{scenario}: Herdr reported {host}, scenario expects {expected}"
             assert "•" in entry(target)["tokens"].get("logo", ""), "Agents lost the unread mark"
             landed = alt_u(cursor)
             print(json.dumps({"scenario": scenario, "host_status_before_jump": host,
