@@ -369,3 +369,114 @@ fn unread_visits_each_marked_peer_after_herdr_reads_their_shared_tab() {
         .commands()
         .contains("notification show No other unread or blocked agents"));
 }
+
+fn peer(pane: &str, status: &str, seq: u64) -> serde_json::Value {
+    let mut peer = agent("a", status, seq);
+    peer["pane_id"] = json!(pane);
+    peer["terminal_id"] = json!(format!("t-{pane}"));
+    peer
+}
+
+/// Agents' published sidebar rows, top to bottom.
+fn sidebar(f: &Fixture, panes: &[&str]) {
+    f.policy.reply.lock().unwrap()["order"] = panes
+        .iter()
+        .map(|pane| json!({"pane_id":pane,"terminal_id":format!("t-{pane}")}))
+        .collect();
+}
+
+fn press(f: &Fixture, mode: &str, cursor: &str) {
+    let output = f
+        .command(mode)
+        .env("HERDR_PANE_ID", cursor)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn every_mode_walks_the_sidebar_rows_not_herdr_recency() {
+    for (mode, status) in [
+        ("jump-recent", "idle"),
+        ("jump-working", "working"),
+        ("jump-unread", "done"),
+    ] {
+        let f = Fixture::new();
+        // Herdr recency says x, y, z; the sidebar shows z, x, y.
+        f.live(vec![
+            peer("x", status, 30),
+            peer("y", status, 20),
+            peer("z", status, 10),
+        ]);
+        sidebar(&f, &["z", "x", "y"]);
+        for cursor in ["outside", "z", "x", "y"] {
+            press(&f, mode, cursor);
+        }
+        // Focusing reads a completion, so unread has nothing left to wrap to.
+        let expected: &[&str] = if mode == "jump-unread" {
+            &["z", "x", "y"]
+        } else {
+            &["z", "x", "y", "z"]
+        };
+        assert_eq!(f.focuses(), expected, "{mode}");
+    }
+}
+
+#[test]
+fn reverse_walks_up_the_sidebar_and_starts_at_the_bottom() {
+    let f = Fixture::new();
+    f.live(vec![
+        peer("x", "idle", 30),
+        peer("y", "idle", 20),
+        peer("z", "idle", 10),
+    ]);
+    sidebar(&f, &["z", "x", "y"]);
+    for cursor in ["outside", "y", "x", "z"] {
+        press(&f, "jump-recent-reverse", cursor);
+    }
+    assert_eq!(f.focuses(), ["y", "x", "z", "y"]);
+}
+
+#[test]
+fn agents_missing_from_the_sidebar_order_follow_it_by_recency() {
+    let f = Fixture::new();
+    f.live(vec![
+        peer("a", "idle", 30),
+        peer("b", "idle", 10),
+        peer("c", "idle", 20),
+    ]);
+    sidebar(&f, &["b"]);
+    for cursor in ["outside", "b", "a"] {
+        press(&f, "jump-recent", cursor);
+    }
+    assert_eq!(f.focuses(), ["b", "a", "c"]);
+}
+
+#[test]
+fn a_replaced_terminal_does_not_inherit_its_panes_row() {
+    let f = Fixture::new();
+    // Herdr recency prefers x; its row belonged to an older terminal.
+    f.live(vec![peer("x", "idle", 30), peer("y", "idle", 10)]);
+    sidebar(&f, &["x", "y"]);
+    f.policy.reply.lock().unwrap()["order"][0]["terminal_id"] = json!("t-old");
+    press(&f, "jump-recent", "outside");
+    assert_eq!(f.focuses(), ["y"]);
+}
+
+#[test]
+fn unread_anchor_continues_below_the_read_row() {
+    let f = Fixture::new();
+    // Herdr recency would go from b back up to a; the sidebar continues down.
+    f.live(vec![
+        peer("a", "done", 10),
+        peer("b", "idle", 20),
+        peer("c", "done", 30),
+    ]);
+    sidebar(&f, &["a", "b", "c"]);
+    press(&f, "jump-unread", "b");
+    assert_eq!(f.focuses(), ["c"]);
+}

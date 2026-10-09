@@ -237,6 +237,16 @@ def run(args):
             agents_frame(root, host, [dict(agent("a", "idle", 40), agent="codex", focused=True)])
             live([agent("a", "idle", 40)])
             execute("jump-unread", "agents-mark-cleared-by-focus", [])
+
+            # The daemon's published order wins over Herdr recency: a fresh
+            # completion leads RECENT, so it is the first stop even though the
+            # cold agent has the newer transition in Herdr's view.
+            fresh = dict(agent("m", "working", 50), agent="codex")
+            cold = dict(agent("f", "idle", 1), agent="codex")
+            agents_frame(root, host, [fresh, cold])
+            agents_frame(root, host, [dict(fresh, agent_status="idle"), cold])
+            live([agent("m", "idle", 51), agent("f", "idle", 90)])
+            execute("jump-recent", "sidebar-order-over-herdr-recency", ["p-m"])
             evidence["scope"] = "Actual daemon + actual Beacon CLI; private fake host and focus recorder; visibility preseed only; Agents unread marks from forced daemon frames; no live session."
         finally:
             if child is not None:
