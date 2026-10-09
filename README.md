@@ -137,7 +137,7 @@ The opt-in `real_unread_navigation.py` harness runs real Herdr, a real Agents da
 python3 tests/real_unread_navigation.py /absolute/herdr-agents target/release/herdr-beacon
 ```
 
-The opt-in `real_sidebar_walk.py` harness builds a folder tree with a RECENT section whose order disagrees with Herdr's transition order, then checks that Agents' published order equals Herdr's rendered order and that `Alt-'` visits every row top to bottom before wrapping.
+The opt-in `real_sidebar_walk.py` harness builds a folder tree with a RECENT section whose order disagrees with Herdr's transition order. It reads the agent rows off the rendered TUI screen (`tests/vt_screen.py`), requires Agents' published order to match them, then presses the installed `Alt-'` shortcut and requires every focus to follow the screen rows top to bottom before wrapping.
 
 ```sh
 python3 tests/real_sidebar_walk.py /absolute/herdr-agents target/release/herdr-beacon
