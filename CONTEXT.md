@@ -17,6 +17,11 @@ them, then rechecks the target's identity, policy and mode before focusing. The
 invoking pane is the cursor; for unread navigation it remains an ordering anchor
 after becoming idle but can never be selected as an unread destination.
 
+Order belongs to the sidebar. Agents publishes its visible rows top to bottom in
+the v3 policy reply; every mode walks those rows and only filters which are
+stops. Agents not drawn yet follow by Herdr `state_change_seq`, which is also the
+whole order when Agents' view is off. A row counts only for the same terminal.
+
 `HerdrClient` is the seam for host operations. The production adapter (`herdr.rs`)
 uses Herdr's CLI and the Agents policy transport (`eligibility.rs`). Its focus
 operation includes tab focus because agent focus alone does not reliably navigate

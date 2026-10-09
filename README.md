@@ -14,12 +14,12 @@ Beacon queries Herdr and Agents when you press a shortcut. Herdr owns agent stat
 
 | Shortcut | Agents included | Order |
 | --- | --- | --- |
-| `Alt-u` | API `done` and `blocked` agents (including already-viewed blockers), plus completions the Agents sidebar still marks unread | Most recent activity first |
-| `Alt-o` | Working and blocked agents | Most recent activity first |
-| `Alt-'` | Idle, done, and unknown agents, including unread completions | Most recent activity first |
-| `Shift-Alt-'` | The same agents | One step backward in that order |
+| `Alt-u` | API `done` and `blocked` agents (including already-viewed blockers), plus completions the Agents sidebar still marks unread | Sidebar, top to bottom |
+| `Alt-o` | Working and blocked agents | Sidebar, top to bottom |
+| `Alt-'` | Idle, done, and unknown agents, including unread completions | Sidebar, top to bottom |
+| `Shift-Alt-'` | The same agents | Sidebar, bottom to top |
 
-Repeated presses advance from the current agent and wrap at the end. `Alt-u` retains your current pane's position after reading its completion, so newer blockers do not get repeated before older requests. `Alt-o` starts with the newest working or blocked turn when you are outside the working/blocked set; `Alt-'` starts with the newest agent when you are outside the eligible set. `Shift-Alt-'` steps toward newer activity and wraps from newest to oldest; when outside the eligible set it starts at the oldest. Forward and reverse undo each other while the live activity order is unchanged. Activity means Herdr's latest lifecycle transition (`state_change_seq`), not how often you focus a pane. Ties use pane ID, and each press refreshes the live order.
+Every shortcut walks the rows you see. Agents publishes its sidebar order, and each shortcut only decides which rows are stops. In the active view the RECENT section comes first, newest first, so the first presses of `Alt-'` visit what you are juggling in strict recency before continuing down the tree. From outside the stop set the first press lands on the topmost stop (`Shift-Alt-'`: the bottom-most); each further press moves to the next stop down (up), wrapping at the end. `Alt-u` retains your current pane's position after reading its completion, so the next press continues below it instead of restarting at the top. Forward and reverse undo each other while the sidebar is unchanged. Agents not yet drawn by Agents follow its rows in Herdr's transition order (`state_change_seq`, newest first); with Agents' view off, Herdr's own panel order applies and every shortcut uses that transition order. Each press refreshes the live order.
 
 - `Alt-u` includes agents Herdr currently reports as `done` or `blocked`, and any agent at rest whose completion Agents still marks unread (✓ •) for the same terminal. An unmarked `idle` agent is never an unread destination, regardless of age or earlier status.
 - Herdr acknowledges completions per tab, Agents per pane. Focusing a pane clears its mark; Beacon reads both on the next press and does not remember its own read/unread state.
@@ -28,7 +28,7 @@ Repeated presses advance from the current agent and wrap at the end. `Alt-u` ret
 
 ## Install
 
-Requires macOS or Linux (including WSL), Herdr 0.7.5 or newer, a Rust toolchain, and a running compatible `shadowfax.agents` daemon implementing workspace-policy protocol v2. Deploy compatible Agents and Beacon versions together; missing or older Agents stops navigation.
+Requires macOS or Linux (including WSL), Herdr 0.7.5 or newer, a Rust toolchain, and a running compatible `shadowfax.agents` daemon implementing workspace-policy protocol v3. Deploy compatible Agents and Beacon versions together; missing or older Agents stops navigation.
 
 On Windows, run Herdr and this plugin inside WSL. Native Windows is not supported.
 
@@ -84,7 +84,7 @@ herdr plugin action invoke shadowfax.beacon.install-keybindings
 
 ## How it works
 
-Every shortcut reads a fresh bulk Agents workspace policy (protocol v2, which includes the sidebar's unread marks) and `herdr agent list`. Beacon filters by workspace eligibility and the chosen mode, then orders the candidates by host `state_change_seq`. It keeps no runtime ledger, filesystem lock, lifecycle hooks, migration, or recovery history.
+Every shortcut reads a fresh bulk Agents workspace policy (protocol v3, which includes the sidebar's unread marks and row order) and `herdr agent list`. Beacon filters by workspace eligibility and the chosen mode, then orders the candidates by their sidebar row (same pane and terminal), with undrawn agents after them by host `state_change_seq`. It keeps no runtime ledger, filesystem lock, lifecycle hooks, migration, or recovery history.
 
 Agents owns `[workspace_visibility].excluded_labels` and exact, case-sensitive label matching. Beacon does not parse that configuration or hardcode labels. Unknown or excluded workspaces cannot be destinations, independently of whether their sidebar rows are shown. A valid empty exclusion list allows every known workspace. Removing an exclusion, moving into an eligible workspace, or recovering the policy endpoint takes effect immediately: an existing API `done` agent is eligible without waiting for another completion.
 
@@ -135,6 +135,12 @@ The opt-in `real_unread_navigation.py` harness runs real Herdr, a real Agents da
 
 ```sh
 python3 tests/real_unread_navigation.py /absolute/herdr-agents target/release/herdr-beacon
+```
+
+The opt-in `real_sidebar_walk.py` harness builds a folder tree with a RECENT section whose order disagrees with Herdr's transition order. It reads the agent rows off the rendered TUI screen (`tests/vt_screen.py`), requires Agents' published order to match them, then presses the installed `Alt-'` shortcut and requires every focus to follow the screen rows top to bottom before wrapping.
+
+```sh
+python3 tests/real_sidebar_walk.py /absolute/herdr-agents target/release/herdr-beacon
 ```
 
 ## Remove

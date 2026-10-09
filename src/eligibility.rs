@@ -1,8 +1,8 @@
-//! Agents owns label resolution and the sidebar's unread marks. This adapter
-//! validates its fresh bulk snapshot for each navigation. Transport failure stops
-//! the action; no cached policy or recovery history can override the next
-//! successful response.
-use std::collections::{BTreeMap, BTreeSet};
+//! Agents owns label resolution, the sidebar's unread marks and its row order.
+//! This adapter validates its fresh bulk snapshot for each navigation. Transport
+//! failure stops the action; no cached policy or recovery history can override
+//! the next successful response.
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
@@ -16,9 +16,10 @@ use crate::model::AgentObservation;
 
 const DEADLINE: Duration = Duration::from_secs(2);
 const MAX_REPLY: usize = 256 * 1024;
-// Version 2 replies add the sidebar's unread marks. Older Agents answers
-// unsupported_version, which stops navigation like any other policy failure.
-const VERSION: u32 = 2;
+// Version 2 replies add the sidebar's unread marks, version 3 its row order.
+// Older Agents answers unsupported_version, which stops navigation like any
+// other policy failure.
+const VERSION: u32 = 3;
 
 /// Only a validated, session-bound snapshot may classify an observation. Display
 /// visibility is deliberately absent from this interface: it cannot grant access.
@@ -28,6 +29,9 @@ pub struct WorkspacePolicy {
     excluded: BTreeSet<String>,
     /// Pane ID to the terminal ID observed in the same Agents frame.
     unread: BTreeMap<String, String>,
+    /// Pane ID to (row from the top, terminal ID). None when Herdr's own panel
+    /// order applies, which Agents cannot predict.
+    order: Option<HashMap<String, (usize, String)>>,
 }
 impl WorkspacePolicy {
     pub fn eligible(&self, workspace: &str) -> bool {
@@ -42,6 +46,16 @@ impl WorkspacePolicy {
         self.unread.get(&agent.pane_id) == Some(&agent.terminal_id)
     }
 
+    /// The agent's row in the sidebar, counted from the top, when Agents drew
+    /// it for this same terminal. Navigation walks rows in this order.
+    pub fn row(&self, agent: &AgentObservation) -> Option<usize> {
+        self.order
+            .as_ref()?
+            .get(&agent.pane_id)
+            .filter(|(_, terminal)| *terminal == agent.terminal_id)
+            .map(|(row, _)| *row)
+    }
+
     /// Real and fake adapters enter through identical wire validation.
     pub fn from_reply(bytes: &[u8], session: &str) -> Result<Self> {
         #[derive(Deserialize)]
@@ -53,12 +67,22 @@ impl WorkspacePolicy {
             workspace_ids: Vec<String>,
             excluded_workspace_ids: Vec<String>,
             show_excluded: bool,
-            unread: Vec<Unread>,
+            unread: Vec<Pane>,
+            // Required, but may be null: present-or-error, unlike a plain Option.
+            #[serde(deserialize_with = "nullable")]
+            order: Option<Vec<Pane>>,
         }
         #[derive(Deserialize)]
-        struct Unread {
+        struct Pane {
             pane_id: String,
             terminal_id: String,
+        }
+        fn nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+            T: Deserialize<'de>,
+        {
+            Option::<T>::deserialize(deserializer)
         }
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
         if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
@@ -97,6 +121,23 @@ impl WorkspacePolicy {
         {
             bail!("Agents policy contains invalid or unsorted unread completions");
         }
+        let order = match reply.order {
+            None => None,
+            Some(rows) => {
+                let mut order = HashMap::with_capacity(rows.len());
+                for (row, pane) in rows.into_iter().enumerate() {
+                    if invalid(&pane.pane_id)
+                        || invalid(&pane.terminal_id)
+                        || order
+                            .insert(pane.pane_id, (row, pane.terminal_id))
+                            .is_some()
+                    {
+                        bail!("Agents policy contains an invalid row order");
+                    }
+                }
+                Some(order)
+            }
+        };
         let workspaces: BTreeSet<_> = reply.workspace_ids.into_iter().collect();
         let excluded: BTreeSet<_> = reply.excluded_workspace_ids.into_iter().collect();
         if !excluded.is_subset(&workspaces) || excluded.len() > 1984 {
@@ -111,6 +152,7 @@ impl WorkspacePolicy {
                 .into_iter()
                 .map(|entry| (entry.pane_id, entry.terminal_id))
                 .collect(),
+            order,
         })
     }
 }

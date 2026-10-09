@@ -119,10 +119,14 @@ pub fn navigate(
                     || (mode == NavigationMode::Unread && is_current(agent, current_pane)))
         })
         .collect();
+    // Walk what the user sees: rows in Agents' published sidebar order, top to
+    // bottom. Agents not drawn there yet, or every agent when Herdr's own panel
+    // order applies, follow in Herdr's transition order (newest first).
     candidates.sort_by(|left, right| {
-        right
-            .state_change_seq
-            .cmp(&left.state_change_seq)
+        let row = |agent| policy.row(agent).unwrap_or(usize::MAX);
+        row(left)
+            .cmp(&row(right))
+            .then_with(|| right.state_change_seq.cmp(&left.state_change_seq))
             .then_with(|| left.pane_id.cmp(&right.pane_id))
     });
     if candidates.is_empty() {

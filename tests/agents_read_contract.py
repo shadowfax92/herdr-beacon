@@ -34,6 +34,9 @@ class Host:
         self.unavailable = False
         # What the Agents daemon sees; Beacon's own host view is live.json.
         self.agents = []
+        # Metadata the daemon reports, echoed in agent.list as Herdr does: the
+        # published row order is read back from these stored sort tokens.
+        self.tokens = {}
         self.done = threading.Event()
         self.listener = socket.socket(socket.AF_UNIX)
         self.listener.bind(str(root / "host.sock"))
@@ -63,7 +66,16 @@ class Host:
                 if method == "workspace.list":
                     result = {"workspaces": self.workspaces}
                 elif method == "agent.list":
-                    result = {"agents": self.agents}
+                    result = {"agents": [dict(a, tokens=dict(self.tokens.get(a["pane_id"], {})))
+                                         for a in self.agents]}
+                elif method == "pane.report_metadata":
+                    stored = self.tokens.setdefault(request["params"]["pane_id"], {})
+                    for key, value in request["params"]["tokens"].items():
+                        if isinstance(value, str) and value.strip():
+                            stored[key] = value.strip()
+                        else:
+                            stored.pop(key, None)
+                    result = {}
                 elif method == "pane.list":
                     result = {"panes": []}
                 elif method == "tab.list":
@@ -237,6 +249,19 @@ def run(args):
             agents_frame(root, host, [dict(agent("a", "idle", 40), agent="codex", focused=True)])
             live([agent("a", "idle", 40)])
             execute("jump-unread", "agents-mark-cleared-by-focus", [])
+
+            # The daemon's published order wins over Herdr recency: a fresh
+            # completion leads RECENT, so it is the first stop even though the
+            # cold agent has the newer transition in Herdr's view. The host
+            # lists the cold agent first, so only stored sort keys can lift m.
+            fresh = dict(agent("m", "working", 50), agent="codex")
+            cold = dict(agent("f", "idle", 1), agent="codex")
+            agents_frame(root, host, [cold, fresh])
+            agents_frame(root, host, [cold, dict(fresh, agent_status="idle")])
+            # The order follows stored tokens: let one frame observe the writes.
+            agents_frame(root, host, [cold, dict(fresh, agent_status="idle")])
+            live([agent("m", "idle", 51), agent("f", "idle", 90)])
+            execute("jump-recent", "sidebar-order-over-herdr-recency", ["p-m"])
             evidence["scope"] = "Actual daemon + actual Beacon CLI; private fake host and focus recorder; visibility preseed only; Agents unread marks from forced daemon frames; no live session."
         finally:
             if child is not None:
